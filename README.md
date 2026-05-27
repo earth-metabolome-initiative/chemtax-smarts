@@ -13,6 +13,17 @@
 RUSTFLAGS="-C target-cpu=native" cargo run --release
 ```
 
+When stdout is an interactive terminal, each label's evolution runs in the
+native full-screen dashboard from `smarts-evolution`, with live MCC and coverage
+plots, the current best SMARTS, and pause, stop, and help controls. Stopping a
+label from the dashboard skips that label and moves on to the next one. When the
+output is redirected or piped (for example in CI), the run falls back to the
+indicatif progress bars instead.
+
+Use `--dashboard` to override the auto-detection. `--dashboard always` forces
+the dashboard even when stdout is not detected as a terminal, and
+`--dashboard never` keeps the progress bars.
+
 By default, each training/test task set includes all positives and samples up
 to 16384 negatives per NPC class. Override negative sampling with
 `--max-negatives-per-npc-class`.

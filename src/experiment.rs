@@ -1,16 +1,16 @@
 use std::cmp::Ordering;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use serde::Serialize;
 use smarts_evolution::{
     EvolutionConfig as SmartsEvolutionConfig, EvolutionError, EvolutionTask, FoldData,
     IndicatifEvolutionProgress, RankedSmarts, SeedCorpus, SmartsEvaluator, SmartsGenome,
-    TaskResult,
+    TaskResult, TuiEvolutionDashboard, TuiEvolutionError,
 };
 use thiserror::Error;
 use zenodo_rs::ZenodoError;
@@ -35,6 +35,8 @@ pub enum ExperimentError {
     Zenodo(#[from] ZenodoError),
     #[error(transparent)]
     Evolution(#[from] EvolutionError),
+    #[error("evolution dashboard failed: {0}")]
+    Dashboard(String),
     #[error("split {0} did not contain any rows")]
     EmptySplit(String),
     #[error("invalid dataset: {0}")]
@@ -54,6 +56,30 @@ pub enum ExperimentError {
         smarts: String,
         message: String,
     },
+}
+
+/// How the per-label evolution renders its live progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DashboardMode {
+    /// Use the native TUI dashboard when stdout is an interactive terminal,
+    /// otherwise fall back to indicatif progress bars.
+    Auto,
+    /// Always use the native TUI dashboard.
+    Always,
+    /// Never use the TUI dashboard, always use indicatif progress bars.
+    Never,
+}
+
+impl DashboardMode {
+    /// Resolve whether the TUI dashboard should drive the evolution phase.
+    fn use_tui(self) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Never => false,
+            Self::Auto => std::io::stdout().is_terminal(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Parser, Serialize)]
@@ -104,6 +130,8 @@ pub struct ExperimentConfig {
     pub slow_evaluation_log_threshold_millis: u64,
     #[arg(long)]
     pub disable_slow_evaluation_logging: bool,
+    #[arg(long, value_enum, default_value_t = DashboardMode::Auto)]
+    pub dashboard: DashboardMode,
 }
 
 impl ExperimentConfig {
@@ -289,10 +317,11 @@ struct ExperimentProgress {
     multi_progress: MultiProgress,
     overall_bar: ProgressBar,
     task_bar: ProgressBar,
+    use_tui: bool,
 }
 
 impl ExperimentProgress {
-    fn new(total_tasks: usize) -> Self {
+    fn new(total_tasks: usize, use_tui: bool) -> Self {
         let multi_progress = MultiProgress::new();
         multi_progress.set_move_cursor(true);
 
@@ -309,6 +338,7 @@ impl ExperimentProgress {
             multi_progress,
             overall_bar,
             task_bar,
+            use_tui,
         }
     }
 
@@ -474,7 +504,7 @@ fn run_all_tasks(
     let evolution_config = config.evolution_config()?;
     let seed_corpus = SeedCorpus::builtin();
     let task_plan = sorted_task_plan(config, inputs)?;
-    let progress = ExperimentProgress::new(task_plan.len());
+    let progress = ExperimentProgress::new(task_plan.len(), config.dashboard.use_tui());
     let task_context = TaskRunContext {
         config,
         evolution_config: &evolution_config,
@@ -531,14 +561,26 @@ fn run_label_task(
         config.max_negatives_per_npc_class,
         &progress.task_bar,
     )?;
-    let result = evolve_fold_with_progress(
+    let Some(result) = evolve_fold_with_progress(
         &task_name,
         training_fold.fold,
         evolution_config,
         seed_corpus,
         config.leaderboard_size,
         task_context.progress,
-    )?;
+    )?
+    else {
+        let skipped = SkippedTaskReport {
+            head: task.head,
+            label_id: task.label_id,
+            label_name: task.label_name.clone(),
+            reason: "stopped from the dashboard before completing".to_owned(),
+            training_counts: counts.training,
+            test_counts: counts.test,
+        };
+        progress.log_skip(&task_name, &skipped.reason);
+        return Ok(TaskOutcome::Skipped(skipped));
+    };
 
     let test_evaluator = build_test_evaluator(task_context, task.head, task.label_id)?;
     let candidates = evaluate_candidates(
@@ -687,6 +729,11 @@ fn build_test_evaluator(
     Ok(SmartsEvaluator::new(vec![test_fold.fold]))
 }
 
+/// Evolve one label's training fold.
+///
+/// Returns `Ok(None)` when an interactive run is stopped from the dashboard, so
+/// the caller can skip the label and continue the sweep. Non-interactive runs
+/// always return `Ok(Some(_))` or an error.
 fn evolve_fold_with_progress(
     task_name: &str,
     training_fold: FoldData,
@@ -694,22 +741,66 @@ fn evolve_fold_with_progress(
     seed_corpus: &SeedCorpus,
     leaderboard_size: usize,
     progress: &ExperimentProgress,
-) -> Result<TaskResult, ExperimentError> {
+) -> Result<Option<TaskResult>, ExperimentError> {
+    let task = EvolutionTask::new(task_name.to_owned(), vec![training_fold]);
+    if progress.use_tui {
+        return run_evolution_with_tui(
+            task,
+            evolution_config,
+            seed_corpus,
+            leaderboard_size,
+            progress,
+        );
+    }
     progress.set_task_phase(
         task_name,
         usize::try_from(evolution_config.generation_limit()).unwrap_or(usize::MAX),
         format!("{task_name} | evolution progress from smarts-evolution"),
     );
-    let task = EvolutionTask::new(task_name.to_owned(), vec![training_fold]);
     let evolution_progress = IndicatifEvolutionProgress::attach_to(&progress.multi_progress)
         .with_best_smarts_width(72)
         .clear_on_finish(true);
-    Ok(task.evolve_owned_with_indicatif_progress(
+    let result = task.evolve_owned_with_indicatif_progress(
         evolution_config,
         seed_corpus,
         leaderboard_size,
         evolution_progress,
-    )?)
+    )?;
+    Ok(Some(result))
+}
+
+/// Drive one label's evolution with the native TUI dashboard.
+///
+/// The indicatif bars are suspended while the dashboard owns the terminal so
+/// their steady-tick redraws do not corrupt the ratatui surface. Pressing stop
+/// in the dashboard returns `Ok(None)`, which the caller treats as a skip.
+fn run_evolution_with_tui(
+    task: EvolutionTask,
+    evolution_config: &SmartsEvolutionConfig,
+    seed_corpus: &SeedCorpus,
+    leaderboard_size: usize,
+    progress: &ExperimentProgress,
+) -> Result<Option<TaskResult>, ExperimentError> {
+    let dashboard = TuiEvolutionDashboard::new().with_best_smarts_width(72);
+    let outcome = progress.multi_progress.suspend(|| {
+        task.evolve_owned_with_tui_dashboard(
+            evolution_config,
+            seed_corpus,
+            leaderboard_size,
+            dashboard,
+        )
+    });
+    match outcome {
+        Ok(result) => Ok(Some(result)),
+        Err(TuiEvolutionError::Stopped) => Ok(None),
+        Err(TuiEvolutionError::Evolution(error)) => Err(ExperimentError::Evolution(error)),
+        Err(TuiEvolutionError::Terminal(error)) => Err(ExperimentError::Dashboard(format!(
+            "could not start or drive the TUI dashboard ({error}); rerun with --dashboard never to use progress bars"
+        ))),
+        Err(
+            error @ (TuiEvolutionError::WorkerDisconnected | TuiEvolutionError::WorkerPanicked),
+        ) => Err(ExperimentError::Dashboard(error.to_string())),
+    }
 }
 
 fn append_task_log_entry(path: &Path, outcome: &TaskOutcome) -> Result<(), ExperimentError> {
@@ -964,6 +1055,7 @@ mod tests {
             disable_match_time_limit: false,
             slow_evaluation_log_threshold_millis: 30_000,
             disable_slow_evaluation_logging: false,
+            dashboard: DashboardMode::Never,
         }
     }
 
@@ -976,6 +1068,7 @@ mod tests {
             multi_progress,
             overall_bar,
             task_bar,
+            use_tui: false,
         }
     }
 
