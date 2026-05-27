@@ -94,13 +94,13 @@ pub struct ExperimentConfig {
     pub min_train_positives: usize,
     #[arg(long, default_value_t = 1)]
     pub min_test_positives: usize,
-    #[arg(long, default_value_t = 16_384)]
+    #[arg(long, default_value_t = 4_096)]
     pub max_negatives_per_npc_class: usize,
     #[arg(long, default_value_t = 32)]
     pub leaderboard_size: usize,
-    #[arg(long, default_value_t = 1024)]
+    #[arg(long, default_value_t = 512)]
     pub population_size: usize,
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 300)]
     pub generation_limit: u64,
     #[arg(long, default_value_t = 0.85)]
     pub mutation_rate: f64,
@@ -114,7 +114,7 @@ pub struct ExperimentConfig {
     pub elite_count: usize,
     #[arg(long, default_value_t = 0.10)]
     pub random_immigrant_ratio: f64,
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = 30)]
     pub stagnation_limit: u64,
     #[arg(long)]
     pub rng_seed: Option<u64>,
@@ -1037,17 +1037,17 @@ mod tests {
             max_labels_per_head: None,
             min_train_positives: 50,
             min_test_positives: 1,
-            max_negatives_per_npc_class: 16_384,
+            max_negatives_per_npc_class: 4_096,
             leaderboard_size: 32,
-            population_size: 1024,
-            generation_limit: 500,
+            population_size: 512,
+            generation_limit: 300,
             mutation_rate: 0.85,
             crossover_rate: 0.70,
             selection_ratio: 0.50,
             tournament_size: 3,
             elite_count: 4,
             random_immigrant_ratio: 0.10,
-            stagnation_limit: 50,
+            stagnation_limit: 30,
             rng_seed: None,
             fitness_cache_capacity: 500_000,
             max_evaluation_smarts_len: None,
@@ -1335,9 +1335,9 @@ mod tests {
         let built = config.evolution_config();
         assert!(built.is_ok());
         let Ok(built) = built else { unreachable!() };
-        assert_eq!(built.population_size(), 1024);
-        assert_eq!(built.generation_limit(), 500);
-        assert_eq!(built.stagnation_limit(), 50);
+        assert_eq!(built.population_size(), 512);
+        assert_eq!(built.generation_limit(), 300);
+        assert_eq!(built.stagnation_limit(), 30);
         assert_eq!(built.tournament_size(), 3);
         assert_eq!(built.elite_count(), 4);
         assert_eq!(built.fitness_cache_capacity(), 500_000);
