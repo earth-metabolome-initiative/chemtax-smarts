@@ -1,107 +1,171 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use clap::Parser;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use serde::Serialize;
+use indicatif::{MultiProgress, ProgressBar};
+use serde::{Deserialize, Serialize};
 use smarts_evolution::{
     EvolutionConfig as SmartsEvolutionConfig, EvolutionError, EvolutionTask, FoldData,
     IndicatifEvolutionProgress, RankedSmarts, SeedCorpus, SmartsEvaluator, SmartsGenome,
-    TaskResult,
+    TaskResult, TuiEvolutionDashboard, TuiEvolutionError,
 };
 use thiserror::Error;
 use zenodo_rs::ZenodoError;
 
 use crate::dataset::{DatasetSplit, FoldSelectionCounts, LabelHead, Vocabulary};
-use crate::download::{
-    DISTILLATION_DATASET_DOI, DISTILLATION_DATASET_RECORD_ID, DownloadedDatasetFile,
-    ensure_distillation_dataset,
-};
+use crate::download::{DatasetName, DownloadedDatasetFile, ensure_dataset};
+use crate::util::{progress_style, usize_to_u64};
 
-const ALL_POSITIVES_PER_NPC_CLASS: usize = usize::MAX;
+const ALL_POSITIVES_PER_LABEL: usize = usize::MAX;
 
+/// Anything that can go wrong while running the experiment.
 #[derive(Debug, Error)]
 pub enum ExperimentError {
+    /// Filesystem or other I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// `JSON` serialization or deserialization failure.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// Parquet read failure.
     #[error(transparent)]
     Parquet(#[from] parquet::errors::ParquetError),
+    /// `Zenodo` download failure.
     #[error(transparent)]
     Zenodo(#[from] ZenodoError),
+    /// Failure inside the `smarts-evolution` engine.
     #[error(transparent)]
     Evolution(#[from] EvolutionError),
+    /// The native `TUI` dashboard could not start or run.
+    #[error("evolution dashboard failed: {0}")]
+    Dashboard(String),
+    /// A named split parsed to zero rows.
     #[error("split {0} did not contain any rows")]
     EmptySplit(String),
+    /// The dataset is structurally invalid or inconsistent.
     #[error("invalid dataset: {0}")]
     InvalidDataset(String),
+    /// A parquet split is missing an expected column.
     #[error("missing parquet column {column} in split {split}")]
-    MissingParquetColumn { split: String, column: String },
+    MissingParquetColumn {
+        /// Name of the split that was being read.
+        split: String,
+        /// Name of the expected column that was absent.
+        column: String,
+    },
+    /// A split row carries `SMILES` that could not be parsed.
     #[error("split {split} contains an invalid SMILES row for CID {cid} ({smiles}): {message}")]
     InvalidSmiles {
+        /// Name of the split holding the bad row.
         split: String,
+        /// `PubChem` CID of the offending row.
         cid: i64,
+        /// The `SMILES` string that failed to parse.
         smiles: String,
+        /// Underlying parser message.
         message: String,
     },
+    /// An evolved `SMARTS` pattern could not be parsed back for scoring.
     #[error("evolved SMARTS '{smarts}' for task {task_id} could not be parsed: {message}")]
     InvalidSmarts {
+        /// Identifier of the task that produced the pattern.
         task_id: String,
+        /// The `SMARTS` string that failed to parse.
         smarts: String,
+        /// Underlying parser message.
         message: String,
     },
 }
 
+/// Whether the native `TUI` dashboard drives the evolution phase: yes when stdout
+/// is an interactive terminal, otherwise the indicatif progress bars are used.
+fn use_tui() -> bool {
+    std::io::stdout().is_terminal()
+}
+
+/// Command line configuration for one experiment run.
 #[derive(Debug, Clone, Parser, Serialize)]
 pub struct ExperimentConfig {
+    /// Which published dataset to evolve against. Required.
+    #[arg(long, value_enum)]
+    pub dataset: DatasetName,
+    /// Directory holding the downloaded dataset files.
     #[arg(long, default_value = "data")]
     pub data_dir: PathBuf,
+    /// Directory where run artifacts are written.
     #[arg(long, default_value = "artifacts")]
     pub output_dir: PathBuf,
+    /// Ignore any existing `results.jsonl` and restart from scratch. By default a
+    /// run resumes, skipping the labels already recorded in `results.jsonl`.
+    #[arg(long)]
+    pub fresh: bool,
+    /// Optional cap on labels evolved per head.
     #[arg(long)]
     pub max_labels_per_head: Option<usize>,
+    /// Minimum training positives a label needs to be evolved.
     #[arg(long, default_value_t = 50)]
     pub min_train_positives: usize,
+    /// Minimum test positives a label needs to be evolved.
     #[arg(long, default_value_t = 1)]
     pub min_test_positives: usize,
-    #[arg(long, default_value_t = 16_384)]
-    pub max_negatives_per_npc_class: usize,
+    /// Cap on sampled negatives per stratification bucket, the bucket being the
+    /// trained head's label.
+    #[arg(long, default_value_t = 4_096)]
+    pub max_negatives_per_label: usize,
+    /// Number of top `SMARTS` kept on each label's leaderboard.
     #[arg(long, default_value_t = 32)]
     pub leaderboard_size: usize,
-    #[arg(long, default_value_t = 1024)]
+    /// Genetic algorithm population size.
+    #[arg(long, default_value_t = 512)]
     pub population_size: usize,
-    #[arg(long, default_value_t = 500)]
+    /// Maximum generations per label.
+    #[arg(long, default_value_t = 300)]
     pub generation_limit: u64,
+    /// Per-individual mutation probability.
     #[arg(long, default_value_t = 0.85)]
     pub mutation_rate: f64,
+    /// Per-pair crossover probability.
     #[arg(long, default_value_t = 0.70)]
     pub crossover_rate: f64,
+    /// Fraction of the population entering the mating pool.
     #[arg(long, default_value_t = 0.50)]
     pub selection_ratio: f64,
+    /// Number of individuals per selection tournament.
     #[arg(long, default_value_t = 3)]
     pub tournament_size: usize,
+    /// Number of top individuals carried over unchanged each generation.
     #[arg(long, default_value_t = 4)]
     pub elite_count: usize,
+    /// Fraction of each generation replaced by random immigrants.
     #[arg(long, default_value_t = 0.10)]
     pub random_immigrant_ratio: f64,
-    #[arg(long, default_value_t = 50)]
+    /// Generations without improvement before a label stops early.
+    #[arg(long, default_value_t = 30)]
     pub stagnation_limit: u64,
+    /// Optional seed for deterministic runs.
     #[arg(long)]
     pub rng_seed: Option<u64>,
+    /// Capacity of the per-label fitness cache.
     #[arg(long, default_value_t = 500_000)]
     pub fitness_cache_capacity: usize,
+    /// Optional cap on the length of `SMARTS` evaluated during evolution.
     #[arg(long)]
     pub max_evaluation_smarts_len: Option<usize>,
+    /// Per-match time budget in milliseconds.
     #[arg(long, default_value_t = 1_000)]
     pub match_time_limit_millis: u64,
+    /// Disable the per-match time limit entirely.
     #[arg(long)]
     pub disable_match_time_limit: bool,
+    /// Log evaluations slower than this many milliseconds.
     #[arg(long, default_value_t = 30_000)]
     pub slow_evaluation_log_threshold_millis: u64,
+    /// Disable slow-evaluation logging entirely.
     #[arg(long)]
     pub disable_slow_evaluation_logging: bool,
 }
@@ -151,75 +215,126 @@ impl ExperimentConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Row counts for one split after sampling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SplitCounts {
+    /// Total sampled rows.
     pub rows: usize,
+    /// Rows matching the trained label.
     pub positives: usize,
+    /// Rows not matching the trained label.
     pub negatives: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Scores for one candidate `SMARTS` on both splits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateScore {
+    /// The candidate `SMARTS` pattern.
     pub smarts: String,
+    /// Length of the `SMARTS` pattern.
     pub smarts_len: usize,
+    /// Matthews correlation coefficient on the training split.
     pub training_mcc: f64,
+    /// Coverage metric on the training split.
     pub training_coverage_score: f64,
+    /// Matthews correlation coefficient on the test split.
     pub test_mcc: f64,
+    /// Coverage metric on the test split.
     pub test_coverage_score: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Outcome of a label whose evolution finished.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletedTaskReport {
-    pub head: LabelHead,
+    /// Head name the label belongs to, such as `class` or `pathway`.
+    pub head: String,
+    /// Numeric label identifier within the head.
     pub label_id: u16,
+    /// Human readable label name.
     pub label_name: String,
+    /// Generations the evolution ran.
     pub generations: u64,
+    /// Sampled counts for the training split.
     pub training_counts: SplitCounts,
+    /// Sampled counts for the test split.
     pub test_counts: SplitCounts,
+    /// Best training individual's `SMARTS`.
     pub training_best_smarts: String,
+    /// Best training individual's Matthews correlation coefficient.
     pub training_best_mcc: f64,
+    /// Best training individual's coverage metric.
     pub training_best_coverage_score: f64,
+    /// Chosen candidate's `SMARTS`.
     pub selected_smarts: String,
+    /// Length of the chosen candidate's `SMARTS`.
     pub selected_smarts_len: usize,
+    /// Chosen candidate's training Matthews correlation coefficient.
     pub selected_training_mcc: f64,
+    /// Chosen candidate's training coverage metric.
     pub selected_training_coverage_score: f64,
+    /// Chosen candidate's test Matthews correlation coefficient.
     pub selected_test_mcc: f64,
+    /// Chosen candidate's test coverage metric.
     pub selected_test_coverage_score: f64,
+    /// All scored leaderboard candidates.
     pub candidates: Vec<CandidateScore>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Outcome of a label that was skipped before or during evolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkippedTaskReport {
-    pub head: LabelHead,
+    /// Head name the label belongs to, such as `class` or `pathway`.
+    pub head: String,
+    /// Numeric label identifier within the head.
     pub label_id: u16,
+    /// Human readable label name.
     pub label_name: String,
+    /// Why the label was skipped.
     pub reason: String,
+    /// Sampled counts for the training split.
     pub training_counts: SplitCounts,
+    /// Sampled counts for the test split.
     pub test_counts: SplitCounts,
 }
 
+/// One line of the results log, serialized as `JSON`.
 #[derive(Debug, Clone, Serialize)]
 pub enum TaskLogEntry {
+    /// A finished label.
     Completed(CompletedTaskReport),
+    /// A skipped label.
     Skipped(SkippedTaskReport),
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// Result of running a single label task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskOutcome {
+    /// A finished label.
     Completed(CompletedTaskReport),
+    /// A skipped label.
     Skipped(SkippedTaskReport),
 }
 
+/// Summary of a whole experiment run.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExperimentSummary {
+    /// `Zenodo` record id of the dataset.
     pub dataset_record_id: u64,
+    /// `DOI` of the dataset.
     pub dataset_doi: String,
+    /// Configuration the run used.
     pub config: ExperimentConfig,
+    /// Files downloaded for the run.
     pub downloaded_files: Vec<DownloadedDatasetFile>,
+    /// Number of labels that finished.
     pub completed_tasks: usize,
+    /// Number of labels that were skipped.
     pub skipped_tasks: usize,
+    /// Directory artifacts were written to.
     pub output_dir: PathBuf,
+    /// Path of the per-label results log.
     pub results_path: PathBuf,
+    /// Outcome of every label task in run order.
     pub outcomes: Vec<TaskOutcome>,
 }
 
@@ -241,11 +356,15 @@ impl InputLoadProgress {
         multi_progress.set_move_cursor(true);
 
         let overall_bar = multi_progress.add(ProgressBar::new(4));
-        overall_bar.set_style(input_overall_progress_style());
+        overall_bar.set_style(progress_style(
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} inputs | {msg}",
+        ));
         overall_bar.set_message("starting input preparation");
 
         let split_bar = multi_progress.add(ProgressBar::new(1));
-        split_bar.set_style(input_split_progress_style());
+        split_bar.set_style(progress_style(
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.magenta/blue}] {pos}/{len} rows | {msg}",
+        ));
         split_bar.enable_steady_tick(Duration::from_millis(100));
         split_bar.set_message("waiting for first split");
 
@@ -268,10 +387,15 @@ impl InputLoadProgress {
         Ok(vocabulary)
     }
 
-    fn load_split(&self, path: &Path, name: &str) -> Result<DatasetSplit, ExperimentError> {
+    fn load_split(
+        &self,
+        path: &Path,
+        name: &str,
+        head_names: &[String],
+    ) -> Result<DatasetSplit, ExperimentError> {
         self.overall_bar.set_message(name.to_owned());
 
-        let split = DatasetSplit::load_with_progress(path, name, &self.split_bar)?;
+        let split = DatasetSplit::load_with_progress(path, name, head_names, &self.split_bar)?;
         self.overall_bar
             .println(format!("[done] {name} | rows={}", split.len()));
         self.overall_bar.inc(1);
@@ -289,19 +413,24 @@ struct ExperimentProgress {
     multi_progress: MultiProgress,
     overall_bar: ProgressBar,
     task_bar: ProgressBar,
+    use_tui: bool,
 }
 
 impl ExperimentProgress {
-    fn new(total_tasks: usize) -> Self {
+    fn new(total_tasks: usize, use_tui: bool) -> Self {
         let multi_progress = MultiProgress::new();
         multi_progress.set_move_cursor(true);
 
         let overall_bar = multi_progress.add(ProgressBar::new(usize_to_u64(total_tasks)));
-        overall_bar.set_style(overall_progress_style());
+        overall_bar.set_style(progress_style(
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} labels | {msg}",
+        ));
         overall_bar.set_message("starting label sweep");
 
         let task_bar = multi_progress.add(ProgressBar::new(1));
-        task_bar.set_style(task_progress_style());
+        task_bar.set_style(progress_style(
+            "{spinner:.green} [{elapsed_precise}] [{wide_bar:.yellow/red}] {pos}/{len} steps | {msg}",
+        ));
         task_bar.enable_steady_tick(Duration::from_millis(100));
         task_bar.set_message("waiting for first label");
 
@@ -309,6 +438,7 @@ impl ExperimentProgress {
             multi_progress,
             overall_bar,
             task_bar,
+            use_tui,
         }
     }
 
@@ -338,7 +468,7 @@ impl ExperimentProgress {
     fn log_done(&self, report: &CompletedTaskReport) {
         self.log_line(format!(
             "[done] {}:{}:{} | selected={} | training_mcc={:.4} training_coverage={:.4} test_mcc={:.4} test_coverage={:.4}",
-            report.head.as_str(),
+            report.head,
             report.label_id,
             report.label_name,
             report.selected_smarts,
@@ -380,6 +510,7 @@ struct TaskSplitCounts {
 struct PlannedLabelTask {
     ordinal: usize,
     head: LabelHead,
+    head_name: String,
     label_id: u16,
     label_name: String,
     training_positives: usize,
@@ -388,16 +519,11 @@ struct PlannedLabelTask {
 
 impl PlannedLabelTask {
     fn task_name(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            self.head.as_str(),
-            self.label_id,
-            self.label_name
-        )
+        format!("{}:{}:{}", self.head_name, self.label_id, self.label_name)
     }
 }
 
-/// Run the full end-to-end experiment over the published distillation splits.
+/// Run the full end-to-end experiment over the selected dataset's splits.
 ///
 /// # Errors
 ///
@@ -411,13 +537,15 @@ pub async fn run_experiment(
     let inputs = load_inputs(config).await?;
     persist_run_metadata(config, &inputs.downloaded_files)?;
 
-    let results_path = initialize_results_path(&config.output_dir)?;
-    let outcomes = run_all_tasks(config, &inputs, &results_path)?;
+    let results_path = config.output_dir.join("results.jsonl");
+    let resumed = initialize_results(&results_path, config.fresh)?;
+    let outcomes = run_all_tasks(config, &inputs, &results_path, resumed)?;
     let (completed_tasks, skipped_tasks) = count_outcomes(&outcomes);
 
+    let spec = config.dataset.spec();
     let summary = ExperimentSummary {
-        dataset_record_id: DISTILLATION_DATASET_RECORD_ID,
-        dataset_doi: DISTILLATION_DATASET_DOI.to_owned(),
+        dataset_record_id: spec.record_id,
+        dataset_doi: spec.doi.to_owned(),
         config: config.clone(),
         downloaded_files: inputs.downloaded_files,
         completed_tasks,
@@ -431,14 +559,23 @@ pub async fn run_experiment(
 }
 
 async fn load_inputs(config: &ExperimentConfig) -> Result<LoadedInputs, ExperimentError> {
-    let downloaded_files = ensure_distillation_dataset(&config.data_dir).await?;
+    let downloaded_files = ensure_dataset(&config.data_dir, config.dataset.spec()).await?;
     let loading_progress = InputLoadProgress::new();
     let vocabulary = loading_progress.load_vocabulary(&config.data_dir.join("vocabulary.json"))?;
-    let train = loading_progress.load_split(&config.data_dir.join("train.parquet"), "train")?;
-    let validation =
-        loading_progress.load_split(&config.data_dir.join("validation.parquet"), "validation")?;
+    let head_names = vocabulary.head_names();
+    let train = loading_progress.load_split(
+        &config.data_dir.join("train.parquet"),
+        "train",
+        &head_names,
+    )?;
+    let validation = loading_progress.load_split(
+        &config.data_dir.join("validation.parquet"),
+        "validation",
+        &head_names,
+    )?;
     let training = DatasetSplit::concatenate("training", vec![train, validation]);
-    let test = loading_progress.load_split(&config.data_dir.join("test.parquet"), "test")?;
+    let test =
+        loading_progress.load_split(&config.data_dir.join("test.parquet"), "test", &head_names)?;
     loading_progress.finish();
     Ok(LoadedInputs {
         downloaded_files,
@@ -460,31 +597,112 @@ fn persist_run_metadata(
     Ok(())
 }
 
-fn initialize_results_path(output_dir: &Path) -> Result<PathBuf, ExperimentError> {
-    let results_path = output_dir.join("results.jsonl");
-    File::create(&results_path)?;
-    Ok(results_path)
+/// The label identity used to decide what a resumed run can skip.
+fn outcome_key(outcome: &TaskOutcome) -> (String, u16) {
+    match outcome {
+        TaskOutcome::Completed(report) => (report.head.clone(), report.label_id),
+        TaskOutcome::Skipped(report) => (report.head.clone(), report.label_id),
+    }
+}
+
+/// Read the outcomes already recorded in a `results.jsonl`. Lines that do not
+/// parse (for example a partial final line from an interrupted run) are dropped,
+/// so their labels are re-run.
+fn load_recorded_outcomes(path: &Path) -> Result<Vec<TaskOutcome>, ExperimentError> {
+    let text = fs::read_to_string(path)?;
+    let mut outcomes = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(outcome) = serde_json::from_str::<TaskOutcome>(line) {
+            outcomes.push(outcome);
+        }
+    }
+    Ok(outcomes)
+}
+
+/// Prepare `results.jsonl` for the run and return the outcomes to resume from.
+///
+/// With `fresh` (or no existing log) the file is truncated and an empty list is
+/// returned. Otherwise the existing log is read, rewritten cleanly (dropping any
+/// partial trailing line), and its outcomes are returned so `run_all_tasks` can
+/// skip those labels.
+fn initialize_results(
+    results_path: &Path,
+    fresh: bool,
+) -> Result<Vec<TaskOutcome>, ExperimentError> {
+    let resumed = if fresh || !results_path.exists() {
+        Vec::new()
+    } else {
+        load_recorded_outcomes(results_path)?
+    };
+    File::create(results_path)?;
+    for outcome in &resumed {
+        append_task_log_entry(results_path, outcome)?;
+    }
+    Ok(resumed)
+}
+
+/// The seed corpus, parsed once per process: the built-in fragments plus the
+/// curated SMARTS embedded from `seeds/corpus.json`. Parsing all ~9k seeds is not
+/// free, so it is cached rather than rebuilt for every run.
+static SEED_CORPUS: LazyLock<Result<SeedCorpus, String>> = LazyLock::new(|| {
+    const CORPUS_JSON: &str = include_str!("../seeds/corpus.json");
+    let seeds: Vec<String> =
+        serde_json::from_str(CORPUS_JSON).map_err(|error| error.to_string())?;
+    let mut corpus = SeedCorpus::builtin();
+    corpus.extend_from_smarts(seeds.iter().map(String::as_str))?;
+    Ok(corpus)
+});
+
+/// Borrow the cached seed corpus.
+///
+/// # Errors
+///
+/// Returns an error if the embedded corpus JSON cannot be parsed or if any seed
+/// SMARTS is invalid for `SmartsGenome`.
+fn build_seed_corpus() -> Result<&'static SeedCorpus, ExperimentError> {
+    match &*SEED_CORPUS {
+        Ok(corpus) => Ok(corpus),
+        Err(error) => Err(ExperimentError::InvalidDataset(error.clone())),
+    }
 }
 
 fn run_all_tasks(
     config: &ExperimentConfig,
     inputs: &LoadedInputs,
     results_path: &Path,
+    resumed: Vec<TaskOutcome>,
 ) -> Result<Vec<TaskOutcome>, ExperimentError> {
     let evolution_config = config.evolution_config()?;
-    let seed_corpus = SeedCorpus::builtin();
+    let seed_corpus = build_seed_corpus()?;
     let task_plan = sorted_task_plan(config, inputs)?;
-    let progress = ExperimentProgress::new(task_plan.len());
+
+    let done: HashSet<(String, u16)> = resumed.iter().map(outcome_key).collect();
+    let remaining: Vec<&PlannedLabelTask> = task_plan
+        .iter()
+        .filter(|task| !done.contains(&(task.head_name.clone(), task.label_id)))
+        .collect();
+
+    if !resumed.is_empty() {
+        eprintln!(
+            "resuming | {} labels already in results.jsonl, {} remaining",
+            resumed.len(),
+            remaining.len()
+        );
+    }
+    let progress = ExperimentProgress::new(remaining.len(), use_tui());
     let task_context = TaskRunContext {
         config,
         evolution_config: &evolution_config,
-        seed_corpus: &seed_corpus,
+        seed_corpus,
         progress: &progress,
         inputs,
     };
-    let mut outcomes = Vec::new();
+    let mut outcomes = resumed;
 
-    for task in &task_plan {
+    for task in remaining {
         let outcome = run_label_task(&task_context, task)?;
         append_task_log_entry(results_path, &outcome)?;
         outcomes.push(outcome);
@@ -493,6 +711,21 @@ fn run_all_tasks(
     let (completed_tasks, skipped_tasks) = count_outcomes(&outcomes);
     progress.finish(completed_tasks, skipped_tasks);
     Ok(outcomes)
+}
+
+fn skipped_report(
+    task: &PlannedLabelTask,
+    reason: String,
+    counts: TaskSplitCounts,
+) -> SkippedTaskReport {
+    SkippedTaskReport {
+        head: task.head_name.clone(),
+        label_id: task.label_id,
+        label_name: task.label_name.clone(),
+        reason,
+        training_counts: counts.training,
+        test_counts: counts.test,
+    }
 }
 
 fn run_label_task(
@@ -509,38 +742,48 @@ fn run_label_task(
     let task_name = task.task_name();
     progress.start_task(&task_name, inputs.training.len(), inputs.test.len());
 
-    let counts = sampled_counts_for_task(task_context, &task_name, task.head, task.label_id);
+    let counts = sampled_counts_for_task(
+        task_context,
+        &task_name,
+        task.head,
+        &task.head_name,
+        task.label_id,
+    );
 
     if let Some(reason) = skip_reason(config, &counts.training, &counts.test) {
-        let skipped = SkippedTaskReport {
-            head: task.head,
-            label_id: task.label_id,
-            label_name: task.label_name.clone(),
-            reason,
-            training_counts: counts.training,
-            test_counts: counts.test,
-        };
+        let skipped = skipped_report(task, reason, counts);
         progress.log_skip(&task_name, &skipped.reason);
         return Ok(TaskOutcome::Skipped(skipped));
     }
 
     let training_fold = inputs.training.build_sampled_fold_with_progress(
         task.head,
+        &task.head_name,
         task.label_id,
-        ALL_POSITIVES_PER_NPC_CLASS,
-        config.max_negatives_per_npc_class,
+        ALL_POSITIVES_PER_LABEL,
+        config.max_negatives_per_label,
         &progress.task_bar,
     )?;
-    let result = evolve_fold_with_progress(
+    let Some(result) = evolve_fold_with_progress(
         &task_name,
         training_fold.fold,
         evolution_config,
         seed_corpus,
         config.leaderboard_size,
         task_context.progress,
-    )?;
+    )?
+    else {
+        let skipped = skipped_report(
+            task,
+            "stopped from the dashboard before completing".to_owned(),
+            counts,
+        );
+        progress.log_skip(&task_name, &skipped.reason);
+        return Ok(TaskOutcome::Skipped(skipped));
+    };
 
-    let test_evaluator = build_test_evaluator(task_context, task.head, task.label_id)?;
+    let test_evaluator =
+        build_test_evaluator(task_context, task.head, &task.head_name, task.label_id)?;
     let candidates = evaluate_candidates(
         &task_name,
         result.leaders(),
@@ -553,7 +796,7 @@ fn run_label_task(
     let selected_test_coverage_score = selected.test_coverage_score;
 
     let report = CompletedTaskReport {
-        head: task.head,
+        head: task.head_name.clone(),
         label_id: task.label_id,
         label_name: task.label_name.clone(),
         generations: result.generations(),
@@ -582,7 +825,8 @@ fn sorted_task_plan(
     let vocabulary = &inputs.vocabulary;
     let mut tasks = Vec::with_capacity(total_task_count(config, vocabulary));
 
-    for head in LabelHead::ALL {
+    for head in vocabulary.heads() {
+        let head_name = vocabulary.head_name(head);
         let labels = vocabulary.labels(head);
         let max_labels = config.max_labels_per_head.unwrap_or(labels.len());
         let training_positives = inputs.training.label_positive_counts(head, labels.len());
@@ -591,8 +835,7 @@ fn sorted_task_plan(
         for (label_index, label_name) in labels.iter().enumerate().take(max_labels) {
             let label_id = u16::try_from(label_index).map_err(|error| {
                 ExperimentError::InvalidDataset(format!(
-                    "label index {label_index} overflowed u16 for {}: {error}",
-                    head.as_str()
+                    "label index {label_index} overflowed u16 for {head_name}: {error}"
                 ))
             })?;
             let training_count = training_positives[label_index];
@@ -602,6 +845,7 @@ fn sorted_task_plan(
             tasks.push(PlannedLabelTask {
                 ordinal: tasks.len(),
                 head,
+                head_name: head_name.to_owned(),
                 label_id,
                 label_name: label_name.clone(),
                 training_positives: training_count,
@@ -629,6 +873,7 @@ fn sampled_counts_for_task(
     task_context: &TaskRunContext<'_>,
     task_name: &str,
     head: LabelHead,
+    head_name: &str,
     label_id: u16,
 ) -> TaskSplitCounts {
     let inputs = task_context.inputs;
@@ -638,9 +883,17 @@ fn sampled_counts_for_task(
             task_name,
             &inputs.training,
             head,
+            head_name,
             label_id,
         ),
-        test: sampled_counts_from_split(task_context, task_name, &inputs.test, head, label_id),
+        test: sampled_counts_from_split(
+            task_context,
+            task_name,
+            &inputs.test,
+            head,
+            head_name,
+            label_id,
+        ),
     }
 }
 
@@ -649,22 +902,23 @@ fn sampled_counts_from_split(
     task_name: &str,
     split: &DatasetSplit,
     head: LabelHead,
+    head_name: &str,
     label_id: u16,
 ) -> SplitCounts {
     task_context.progress.set_task_phase(
         task_name,
         split.len(),
         format!(
-            "{} | counting sampled {}:{label_id} rows",
+            "{} | counting sampled {head_name}:{label_id} rows",
             split.name(),
-            head.as_str()
         ),
     );
     let counts = split.sampled_counts_with_progress(
         head,
+        head_name,
         label_id,
-        ALL_POSITIVES_PER_NPC_CLASS,
-        task_context.config.max_negatives_per_npc_class,
+        ALL_POSITIVES_PER_LABEL,
+        task_context.config.max_negatives_per_label,
         &task_context.progress.task_bar,
     );
     counts_from_selection_counts(counts)
@@ -673,20 +927,27 @@ fn sampled_counts_from_split(
 fn build_test_evaluator(
     task_context: &TaskRunContext<'_>,
     head: LabelHead,
+    head_name: &str,
     label_id: u16,
 ) -> Result<SmartsEvaluator, ExperimentError> {
     let config = task_context.config;
     let progress = &task_context.progress.task_bar;
     let test_fold = task_context.inputs.test.build_sampled_fold_with_progress(
         head,
+        head_name,
         label_id,
-        ALL_POSITIVES_PER_NPC_CLASS,
-        config.max_negatives_per_npc_class,
+        ALL_POSITIVES_PER_LABEL,
+        config.max_negatives_per_label,
         progress,
     )?;
     Ok(SmartsEvaluator::new(vec![test_fold.fold]))
 }
 
+/// Evolve one label's training fold.
+///
+/// Returns `Ok(None)` when an interactive run is stopped from the dashboard, so
+/// the caller can skip the label and continue the sweep. Non-interactive runs
+/// always return `Ok(Some(_))` or an error.
 fn evolve_fold_with_progress(
     task_name: &str,
     training_fold: FoldData,
@@ -694,22 +955,66 @@ fn evolve_fold_with_progress(
     seed_corpus: &SeedCorpus,
     leaderboard_size: usize,
     progress: &ExperimentProgress,
-) -> Result<TaskResult, ExperimentError> {
+) -> Result<Option<TaskResult>, ExperimentError> {
+    let task = EvolutionTask::new(task_name.to_owned(), vec![training_fold]);
+    if progress.use_tui {
+        return run_evolution_with_tui(
+            task,
+            evolution_config,
+            seed_corpus,
+            leaderboard_size,
+            progress,
+        );
+    }
     progress.set_task_phase(
         task_name,
         usize::try_from(evolution_config.generation_limit()).unwrap_or(usize::MAX),
         format!("{task_name} | evolution progress from smarts-evolution"),
     );
-    let task = EvolutionTask::new(task_name.to_owned(), vec![training_fold]);
     let evolution_progress = IndicatifEvolutionProgress::attach_to(&progress.multi_progress)
         .with_best_smarts_width(72)
         .clear_on_finish(true);
-    Ok(task.evolve_owned_with_indicatif_progress(
+    let result = task.evolve_owned_with_indicatif_progress(
         evolution_config,
         seed_corpus,
         leaderboard_size,
         evolution_progress,
-    )?)
+    )?;
+    Ok(Some(result))
+}
+
+/// Drive one label's evolution with the native TUI dashboard.
+///
+/// The indicatif bars are suspended while the dashboard owns the terminal so
+/// their steady-tick redraws do not corrupt the ratatui surface. Pressing stop
+/// in the dashboard returns `Ok(None)`, which the caller treats as a skip.
+fn run_evolution_with_tui(
+    task: EvolutionTask,
+    evolution_config: &SmartsEvolutionConfig,
+    seed_corpus: &SeedCorpus,
+    leaderboard_size: usize,
+    progress: &ExperimentProgress,
+) -> Result<Option<TaskResult>, ExperimentError> {
+    let dashboard = TuiEvolutionDashboard::new().with_best_smarts_width(72);
+    let outcome = progress.multi_progress.suspend(|| {
+        task.evolve_owned_with_tui_dashboard(
+            evolution_config,
+            seed_corpus,
+            leaderboard_size,
+            dashboard,
+        )
+    });
+    match outcome {
+        Ok(result) => Ok(Some(result)),
+        Err(TuiEvolutionError::Stopped) => Ok(None),
+        Err(TuiEvolutionError::Evolution(error)) => Err(ExperimentError::Evolution(error)),
+        Err(TuiEvolutionError::Terminal(error)) => Err(ExperimentError::Dashboard(format!(
+            "could not start or drive the TUI dashboard ({error}). Redirect or pipe stdout to fall back to progress bars"
+        ))),
+        Err(
+            error @ (TuiEvolutionError::WorkerDisconnected | TuiEvolutionError::WorkerPanicked),
+        ) => Err(ExperimentError::Dashboard(error.to_string())),
+    }
 }
 
 fn append_task_log_entry(path: &Path, outcome: &TaskOutcome) -> Result<(), ExperimentError> {
@@ -765,8 +1070,8 @@ fn skip_reason(
 }
 
 fn total_task_count(config: &ExperimentConfig, vocabulary: &Vocabulary) -> usize {
-    LabelHead::ALL
-        .into_iter()
+    vocabulary
+        .heads()
         .map(|head| {
             let label_count = vocabulary.labels(head).len();
             config
@@ -774,50 +1079,6 @@ fn total_task_count(config: &ExperimentConfig, vocabulary: &Vocabulary) -> usize
                 .map_or(label_count, |limit| limit.min(label_count))
         })
         .sum()
-}
-
-fn overall_progress_style() -> ProgressStyle {
-    let style = match ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} labels | {msg}",
-    ) {
-        Ok(style) => style,
-        Err(_) => ProgressStyle::default_bar(),
-    };
-    style.progress_chars("=> ")
-}
-
-fn input_overall_progress_style() -> ProgressStyle {
-    let style = match ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} inputs | {msg}",
-    ) {
-        Ok(style) => style,
-        Err(_) => ProgressStyle::default_bar(),
-    };
-    style.progress_chars("=> ")
-}
-
-fn input_split_progress_style() -> ProgressStyle {
-    let style = match ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.magenta/blue}] {pos}/{len} rows | {msg}",
-    ) {
-        Ok(style) => style,
-        Err(_) => ProgressStyle::default_bar(),
-    };
-    style.progress_chars("=> ")
-}
-
-fn task_progress_style() -> ProgressStyle {
-    let style = match ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.yellow/red}] {pos}/{len} steps | {msg}",
-    ) {
-        Ok(style) => style,
-        Err(_) => ProgressStyle::default_bar(),
-    };
-    style.progress_chars("=> ")
-}
-
-fn usize_to_u64(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn evaluate_candidates(
@@ -845,17 +1106,33 @@ fn evaluate_candidates(
         progress
             .task_bar
             .set_position(usize_to_u64(completed_steps));
-        candidates.push(CandidateScore {
-            smarts: leader.smarts().to_owned(),
-            smarts_len: leader.smarts_len(),
-            training_mcc: leader.mcc(),
-            training_coverage_score: leader.coverage_score(),
-            test_mcc: test_score.mcc,
-            test_coverage_score: test_score.coverage_score,
-        });
+        candidates.push(candidate_score(
+            leader.smarts(),
+            leader.smarts_len(),
+            leader.mcc(),
+            leader.coverage_score(),
+            &test_score,
+        ));
     }
     candidates.sort_by(compare_candidates);
     Ok(candidates)
+}
+
+fn candidate_score(
+    smarts: &str,
+    smarts_len: usize,
+    training_mcc: f64,
+    training_coverage_score: f64,
+    test_score: &EvaluationScore,
+) -> CandidateScore {
+    CandidateScore {
+        smarts: smarts.to_owned(),
+        smarts_len,
+        training_mcc,
+        training_coverage_score,
+        test_mcc: test_score.mcc,
+        test_coverage_score: test_score.coverage_score,
+    }
 }
 
 fn select_candidate(
@@ -864,14 +1141,13 @@ fn select_candidate(
     test_evaluator: &SmartsEvaluator,
 ) -> Result<CandidateScore, ExperimentError> {
     let test_score = evaluate_smarts(task_id, result.best_smarts(), test_evaluator)?;
-    Ok(CandidateScore {
-        smarts: result.best_smarts().to_owned(),
-        smarts_len: result.best_smarts_len(),
-        training_mcc: result.best_mcc(),
-        training_coverage_score: result.best_coverage_score(),
-        test_mcc: test_score.mcc,
-        test_coverage_score: test_score.coverage_score,
-    })
+    Ok(candidate_score(
+        result.best_smarts(),
+        result.best_smarts_len(),
+        result.best_mcc(),
+        result.best_coverage_score(),
+        &test_score,
+    ))
 }
 
 fn compare_candidates(left: &CandidateScore, right: &CandidateScore) -> Ordering {
@@ -911,52 +1187,65 @@ fn evaluate_smarts(
 }
 
 fn append_json_line(path: &Path, value: &(impl Serialize + ?Sized)) -> Result<(), ExperimentError> {
-    let mut handle = OpenOptions::new().append(true).open(path)?;
-    serde_json::to_writer(&mut handle, value)?;
-    handle.write_all(b"\n")?;
-    Ok(())
+    write_json(OpenOptions::new().append(true).open(path)?, false, value)
 }
 
 fn write_json_pretty(
     path: &Path,
     value: &(impl Serialize + ?Sized),
 ) -> Result<(), ExperimentError> {
-    let mut handle = File::create(path)?;
-    serde_json::to_writer_pretty(&mut handle, value)?;
+    write_json(File::create(path)?, true, value)
+}
+
+fn write_json(
+    mut handle: File,
+    pretty: bool,
+    value: &(impl Serialize + ?Sized),
+) -> Result<(), ExperimentError> {
+    if pretty {
+        serde_json::to_writer_pretty(&mut handle, value)?;
+    } else {
+        serde_json::to_writer(&mut handle, value)?;
+    }
     handle.write_all(b"\n")?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use arrow_array::{Int64Array, ListArray, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-    use parquet::arrow::ArrowWriter;
-
     use super::*;
+    use crate::download::{CLASSYFIRE_DATASET, DatasetSpec, NPCLASSIFIER_DATASET};
+    use crate::test_support::{
+        self, NPC_HEADS, TestSplitRow, ok, populate_dataset_dir, slice_parquet, temp_dir,
+        touch_missing_spec_files,
+    };
 
     type TestClassRow = (&'static str, i64, Vec<u16>);
 
+    fn npc_head_names() -> Vec<String> {
+        test_support::head_names(&NPC_HEADS)
+    }
+
     fn baseline_config() -> ExperimentConfig {
         ExperimentConfig {
+            dataset: DatasetName::Npclassifier,
             data_dir: PathBuf::from("data"),
             output_dir: PathBuf::from("artifacts"),
+            fresh: false,
             max_labels_per_head: None,
             min_train_positives: 50,
             min_test_positives: 1,
-            max_negatives_per_npc_class: 16_384,
+            max_negatives_per_label: 4_096,
             leaderboard_size: 32,
-            population_size: 1024,
-            generation_limit: 500,
+            population_size: 512,
+            generation_limit: 300,
             mutation_rate: 0.85,
             crossover_rate: 0.70,
             selection_ratio: 0.50,
             tournament_size: 3,
             elite_count: 4,
             random_immigrant_ratio: 0.10,
-            stagnation_limit: 50,
+            stagnation_limit: 30,
             rng_seed: None,
             fitness_cache_capacity: 500_000,
             max_evaluation_smarts_len: None,
@@ -976,116 +1265,59 @@ mod tests {
             multi_progress,
             overall_bar,
             task_bar,
+            use_tui: false,
         }
     }
 
+    /// Write a 3-head `NPClassifier` split with only `class` labels populated,
+    /// delegating the arrow work to the shared fixture.
     fn write_split_parquet(path: &Path, rows: &[TestClassRow]) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("cid", DataType::Int64, false),
-            Field::new("smiles", DataType::Utf8, false),
-            Field::new(
-                "pathway_ids",
-                DataType::List(Arc::new(Field::new("item", DataType::UInt16, true))),
-                false,
-            ),
-            Field::new(
-                "superclass_ids",
-                DataType::List(Arc::new(Field::new("item", DataType::UInt16, true))),
-                false,
-            ),
-            Field::new(
-                "class_ids",
-                DataType::List(Arc::new(Field::new("item", DataType::UInt16, true))),
-                false,
-            ),
-        ]));
-        let cids = rows.iter().map(|(_, cid, _)| *cid).collect::<Int64Array>();
-        let smiles = StringArray::from_iter_values(rows.iter().map(|(smiles, _, _)| *smiles));
-        let empty_labels = rows.iter().map(|_| Some(std::iter::empty::<Option<u16>>()));
-        let class_ids = ListArray::from_iter_primitive::<arrow_array::types::UInt16Type, _, _>(
-            rows.iter()
-                .map(|(_, _, class_ids)| Some(class_ids.iter().copied().map(Some))),
-        );
-        let batch_result = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(cids),
-                Arc::new(smiles),
-                Arc::new(ListArray::from_iter_primitive::<
-                    arrow_array::types::UInt16Type,
-                    _,
-                    _,
-                >(empty_labels.clone())),
-                Arc::new(ListArray::from_iter_primitive::<
-                    arrow_array::types::UInt16Type,
-                    _,
-                    _,
-                >(empty_labels)),
-                Arc::new(class_ids),
-            ],
-        );
-        assert!(batch_result.is_ok());
-        let file_result = File::create(path);
-        assert!(file_result.is_ok());
-        let Ok(file) = file_result else {
-            unreachable!()
-        };
-        let writer_result = ArrowWriter::try_new(file, Arc::clone(&schema), None);
-        assert!(writer_result.is_ok());
-        let Ok(mut writer) = writer_result else {
-            unreachable!()
-        };
-        let Ok(batch) = batch_result else {
-            unreachable!()
-        };
-        let batch_write_result = writer.write(&batch);
-        assert!(batch_write_result.is_ok());
-        let close_result = writer.close();
-        assert!(close_result.is_ok());
+        let generic: Vec<test_support::TestSplitRow> = rows
+            .iter()
+            .map(|(smiles, cid, class_ids)| {
+                (
+                    *smiles,
+                    *cid,
+                    vec![Vec::new(), Vec::new(), class_ids.clone()],
+                )
+            })
+            .collect();
+        test_support::write_split_parquet(path, &NPC_HEADS, &generic);
     }
 
-    fn load_inputs_for_class_task(root: &Path) -> LoadedInputs {
+    // Write vocabulary.json plus three split parquets, load them, and fold
+    // train+validation into a single "training" split.
+    fn build_inputs(
+        root: &Path,
+        vocabulary_json: &str,
+        train: &[TestClassRow],
+        validation: &[TestClassRow],
+        test: &[TestClassRow],
+    ) -> LoadedInputs {
         let vocabulary_path = root.join("vocabulary.json");
-        let write_vocabulary_result = std::fs::write(
-            &vocabulary_path,
-            "{\n  \"pathway\": [],\n  \"superclass\": [],\n  \"class\": [\"amine\"]\n}\n",
-        );
-        assert!(write_vocabulary_result.is_ok());
+        ok(std::fs::write(&vocabulary_path, vocabulary_json));
 
-        write_split_parquet(
+        write_split_parquet(&root.join("train.parquet"), train);
+        write_split_parquet(&root.join("validation.parquet"), validation);
+        write_split_parquet(&root.join("test.parquet"), test);
+
+        let vocabulary = ok(Vocabulary::load(&vocabulary_path));
+        let heads = npc_head_names();
+        let train = ok(DatasetSplit::load(
             &root.join("train.parquet"),
-            &[
-                ("CCN", 1, vec![0]),
-                ("N", 2, vec![0]),
-                ("CCO", 3, vec![]),
-                ("O", 4, vec![]),
-            ],
-        );
-        write_split_parquet(
+            "train",
+            &heads,
+        ));
+        let validation = ok(DatasetSplit::load(
             &root.join("validation.parquet"),
-            &[("CN", 5, vec![0]), ("CO", 6, vec![])],
-        );
-        write_split_parquet(
+            "validation",
+            &heads,
+        ));
+        let test = ok(DatasetSplit::load(
             &root.join("test.parquet"),
-            &[("CCN", 7, vec![0]), ("CCO", 8, vec![])],
-        );
-
-        let vocabulary = Vocabulary::load(&vocabulary_path);
-        assert!(vocabulary.is_ok());
-        let train = DatasetSplit::load(&root.join("train.parquet"), "train");
-        assert!(train.is_ok());
-        let validation = DatasetSplit::load(&root.join("validation.parquet"), "validation");
-        assert!(validation.is_ok());
-        let test = DatasetSplit::load(&root.join("test.parquet"), "test");
-        assert!(test.is_ok());
-        let Ok(vocabulary) = vocabulary else {
-            unreachable!()
-        };
-        let Ok(train) = train else { unreachable!() };
-        let Ok(validation) = validation else {
-            unreachable!()
-        };
-        let Ok(test) = test else { unreachable!() };
+            "test",
+            &heads,
+        ));
 
         LoadedInputs {
             downloaded_files: Vec::new(),
@@ -1093,6 +1325,21 @@ mod tests {
             training: DatasetSplit::concatenate("training", vec![train, validation]),
             test,
         }
+    }
+
+    fn load_inputs_for_class_task(root: &Path) -> LoadedInputs {
+        build_inputs(
+            root,
+            "{\n  \"pathway\": [],\n  \"superclass\": [],\n  \"class\": [\"amine\"]\n}\n",
+            &[
+                ("CCN", 1, vec![0]),
+                ("N", 2, vec![0]),
+                ("CCO", 3, vec![]),
+                ("O", 4, vec![]),
+            ],
+            &[("CN", 5, vec![0]), ("CO", 6, vec![])],
+            &[("CCN", 7, vec![0]), ("CCO", 8, vec![])],
+        )
     }
 
     fn planned_task(
@@ -1104,7 +1351,8 @@ mod tests {
     ) -> PlannedLabelTask {
         PlannedLabelTask {
             ordinal,
-            head: LabelHead::Class,
+            head: LabelHead::new(2),
+            head_name: String::from("class"),
             label_id,
             label_name: label_name.to_owned(),
             training_positives,
@@ -1119,17 +1367,19 @@ mod tests {
     ) -> PlannedLabelTask {
         let label_index = usize::from(label_id);
         let label_count = label_index + 1;
+        let class = LabelHead::new(2);
         let training_positives = task_context
             .inputs
             .training
-            .label_positive_counts(LabelHead::Class, label_count)[label_index];
+            .label_positive_counts(class, label_count)[label_index];
         let test_positives = task_context
             .inputs
             .test
-            .label_positive_counts(LabelHead::Class, label_count)[label_index];
+            .label_positive_counts(class, label_count)[label_index];
         PlannedLabelTask {
             ordinal: 0,
-            head: LabelHead::Class,
+            head: class,
+            head_name: String::from("class"),
             label_id,
             label_name: label_name.to_owned(),
             training_positives,
@@ -1138,20 +1388,12 @@ mod tests {
     }
 
     #[test]
-    fn label_head_iteration_order_is_stable() {
-        assert_eq!(
-            LabelHead::ALL,
-            [LabelHead::Pathway, LabelHead::Superclass, LabelHead::Class]
-        );
-    }
-
-    #[test]
     fn total_task_count_respects_head_limits() {
-        let vocabulary = Vocabulary {
-            pathway: vec![String::from("p0"), String::from("p1")],
-            superclass: vec![String::from("s0")],
-            class_labels: vec![String::from("c0"), String::from("c1"), String::from("c2")],
-        };
+        let vocabulary = Vocabulary::from_pairs([
+            ("pathway", vec!["p0", "p1"]),
+            ("superclass", vec!["s0"]),
+            ("class", vec!["c0", "c1", "c2"]),
+        ]);
         let mut config = baseline_config();
         config.max_labels_per_head = Some(2);
         assert_eq!(total_task_count(&config, &vocabulary), 5);
@@ -1159,62 +1401,24 @@ mod tests {
 
     #[test]
     fn task_plan_filters_labels_with_too_few_training_examples() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("npc-smarts-task-plan-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        let create_dir_result = std::fs::create_dir_all(&temp_dir);
-        assert!(create_dir_result.is_ok());
+        let temp_dir = temp_dir("task-plan");
 
-        let vocabulary_path = temp_dir.join("vocabulary.json");
-        let write_vocabulary_result = std::fs::write(
-            &vocabulary_path,
+        let inputs = build_inputs(
+            &temp_dir,
             "{\n  \"pathway\": [],\n  \"superclass\": [],\n  \"class\": [\"rare\", \"kept\"]\n}\n",
-        );
-        assert!(write_vocabulary_result.is_ok());
-        write_split_parquet(
-            &temp_dir.join("train.parquet"),
             &[
                 ("CN", 1, vec![0]),
                 ("CCN", 2, vec![1]),
                 ("N", 3, vec![1]),
                 ("CCO", 4, vec![]),
             ],
-        );
-        write_split_parquet(
-            &temp_dir.join("validation.parquet"),
             &[("CN", 5, vec![0]), ("CCN", 6, vec![1])],
-        );
-        write_split_parquet(
-            &temp_dir.join("test.parquet"),
             &[("CN", 7, vec![0]), ("CCN", 8, vec![1])],
         );
-
-        let vocabulary = Vocabulary::load(&vocabulary_path);
-        assert!(vocabulary.is_ok());
-        let train = DatasetSplit::load(&temp_dir.join("train.parquet"), "train");
-        assert!(train.is_ok());
-        let validation = DatasetSplit::load(&temp_dir.join("validation.parquet"), "validation");
-        assert!(validation.is_ok());
-        let test = DatasetSplit::load(&temp_dir.join("test.parquet"), "test");
-        assert!(test.is_ok());
-        let Ok(train) = train else { unreachable!() };
-        let Ok(validation) = validation else {
-            unreachable!()
-        };
-        let inputs = LoadedInputs {
-            downloaded_files: Vec::new(),
-            vocabulary: vocabulary.unwrap_or_else(|_| unreachable!()),
-            training: DatasetSplit::concatenate("training", vec![train, validation]),
-            test: test.unwrap_or_else(|_| unreachable!()),
-        };
         let mut config = baseline_config();
         config.min_train_positives = 3;
 
-        let task_plan = sorted_task_plan(&config, &inputs);
-        assert!(task_plan.is_ok());
-        let Ok(task_plan) = task_plan else {
-            unreachable!()
-        };
+        let task_plan = ok(sorted_task_plan(&config, &inputs));
         assert_eq!(task_plan.len(), 1);
         assert_eq!(task_plan[0].label_name, "kept");
 
@@ -1239,12 +1443,10 @@ mod tests {
     #[test]
     fn evolution_config_uses_tuned_defaults() {
         let config = baseline_config();
-        let built = config.evolution_config();
-        assert!(built.is_ok());
-        let Ok(built) = built else { unreachable!() };
-        assert_eq!(built.population_size(), 1024);
-        assert_eq!(built.generation_limit(), 500);
-        assert_eq!(built.stagnation_limit(), 50);
+        let built = ok(config.evolution_config());
+        assert_eq!(built.population_size(), 512);
+        assert_eq!(built.generation_limit(), 300);
+        assert_eq!(built.stagnation_limit(), 30);
         assert_eq!(built.tournament_size(), 3);
         assert_eq!(built.elite_count(), 4);
         assert_eq!(built.fitness_cache_capacity(), 500_000);
@@ -1268,9 +1470,7 @@ mod tests {
         config.match_time_limit_millis = 250;
         config.slow_evaluation_log_threshold_millis = 250;
 
-        let built = config.evolution_config();
-        assert!(built.is_ok());
-        let Ok(built) = built else { unreachable!() };
+        let built = ok(config.evolution_config());
         assert_eq!(built.max_evaluation_smarts_len(), Some(96));
         assert_eq!(built.match_time_limit(), Some(Duration::from_millis(250)));
         assert_eq!(
@@ -1284,9 +1484,7 @@ mod tests {
         let mut config = baseline_config();
         config.disable_match_time_limit = true;
 
-        let built = config.evolution_config();
-        assert!(built.is_ok());
-        let Ok(built) = built else { unreachable!() };
+        let built = ok(config.evolution_config());
         assert_eq!(built.match_time_limit(), None);
     }
 
@@ -1295,16 +1493,14 @@ mod tests {
         let mut config = baseline_config();
         config.disable_slow_evaluation_logging = true;
 
-        let built = config.evolution_config();
-        assert!(built.is_ok());
-        let Ok(built) = built else { unreachable!() };
+        let built = ok(config.evolution_config());
         assert_eq!(built.slow_evaluation_log_threshold(), None);
     }
 
     #[test]
     fn count_outcomes_splits_completed_and_skipped() {
         let completed = CompletedTaskReport {
-            head: LabelHead::Class,
+            head: String::from("class"),
             label_id: 0,
             label_name: String::from("test"),
             generations: 1,
@@ -1330,7 +1526,7 @@ mod tests {
             candidates: Vec::new(),
         };
         let skipped = SkippedTaskReport {
-            head: LabelHead::Pathway,
+            head: String::from("pathway"),
             label_id: 1,
             label_name: String::from("skip"),
             reason: String::from("not enough positives"),
@@ -1428,51 +1624,36 @@ mod tests {
 
     #[test]
     fn json_helpers_write_expected_payloads() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("npc-smarts-json-helpers-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        let create_dir_result = std::fs::create_dir_all(&temp_dir);
-        assert!(create_dir_result.is_ok());
+        let temp_dir = temp_dir("json-helpers");
 
         let jsonl_path = temp_dir.join("results.jsonl");
-        let init_result = File::create(&jsonl_path);
-        assert!(init_result.is_ok());
+        ok(File::create(&jsonl_path));
         let json_path = temp_dir.join("summary.json");
 
-        let append_result = append_json_line(
+        ok(append_json_line(
             &jsonl_path,
             &SplitCounts {
                 rows: 3,
                 positives: 1,
                 negatives: 2,
             },
-        );
-        assert!(append_result.is_ok());
-        let pretty_write_result = write_json_pretty(
+        ));
+        ok(write_json_pretty(
             &json_path,
             &SplitCounts {
                 rows: 4,
                 positives: 2,
                 negatives: 2,
             },
-        );
-        assert!(pretty_write_result.is_ok());
+        ));
 
-        let jsonl_read_result = std::fs::read_to_string(&jsonl_path);
-        assert!(jsonl_read_result.is_ok());
-        let Ok(jsonl_payload) = jsonl_read_result else {
-            unreachable!()
-        };
+        let jsonl_payload = ok(std::fs::read_to_string(&jsonl_path));
         assert_eq!(
             jsonl_payload,
             "{\"rows\":3,\"positives\":1,\"negatives\":2}\n"
         );
 
-        let summary_read_result = std::fs::read_to_string(&json_path);
-        assert!(summary_read_result.is_ok());
-        let Ok(summary_payload) = summary_read_result else {
-            unreachable!()
-        };
+        let summary_payload = ok(std::fs::read_to_string(&json_path));
         assert!(summary_payload.contains("\"rows\": 4"));
         assert!(summary_payload.ends_with('\n'));
 
@@ -1481,11 +1662,7 @@ mod tests {
 
     #[test]
     fn run_label_task_completes_on_small_class_problem() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("npc-smarts-run-label-task-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        let create_dir_result = std::fs::create_dir_all(&temp_dir);
-        assert!(create_dir_result.is_ok());
+        let temp_dir = temp_dir("run-label-task");
 
         let inputs = load_inputs_for_class_task(&temp_dir);
         let mut config = baseline_config();
@@ -1495,11 +1672,7 @@ mod tests {
         config.stagnation_limit = 3;
         config.leaderboard_size = 4;
         config.rng_seed = Some(7);
-        let evolution_config = config.evolution_config();
-        assert!(evolution_config.is_ok());
-        let Ok(evolution_config) = evolution_config else {
-            unreachable!()
-        };
+        let evolution_config = ok(config.evolution_config());
         let progress = hidden_experiment_progress();
         let seed_corpus = SeedCorpus::builtin();
         let task_context = TaskRunContext {
@@ -1511,11 +1684,10 @@ mod tests {
         };
         let task = planned_class_task(&task_context, 0, "amine");
         let outcome = run_label_task(&task_context, &task);
-        assert!(outcome.is_ok());
-        let Ok(TaskOutcome::Completed(report)) = outcome else {
+        let TaskOutcome::Completed(report) = ok(outcome) else {
             unreachable!();
         };
-        assert_eq!(report.head, LabelHead::Class);
+        assert_eq!(report.head, "class");
         assert_eq!(report.label_id, 0);
         assert_eq!(report.training_counts.positives, 3);
         assert_eq!(report.test_counts.positives, 1);
@@ -1527,20 +1699,12 @@ mod tests {
 
     #[test]
     fn run_label_task_returns_skipped_when_thresholds_are_not_met() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("npc-smarts-run-label-skip-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        let create_dir_result = std::fs::create_dir_all(&temp_dir);
-        assert!(create_dir_result.is_ok());
+        let temp_dir = temp_dir("run-label-skip");
 
         let inputs = load_inputs_for_class_task(&temp_dir);
         let mut config = baseline_config();
         config.min_train_positives = 10;
-        let evolution_config = config.evolution_config();
-        assert!(evolution_config.is_ok());
-        let Ok(evolution_config) = evolution_config else {
-            unreachable!()
-        };
+        let evolution_config = ok(config.evolution_config());
         let progress = hidden_experiment_progress();
         let seed_corpus = SeedCorpus::builtin();
         let task_context = TaskRunContext {
@@ -1555,5 +1719,371 @@ mod tests {
         assert!(matches!(outcome, Ok(TaskOutcome::Skipped(_))));
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn seed_corpus_embeds_curated_smarts() {
+        let builtin = SeedCorpus::builtin().len();
+        let corpus = ok(build_seed_corpus());
+        assert!(
+            corpus.len() > builtin + 9_000,
+            "corpus {} should add the curated seeds to builtin {builtin}",
+            corpus.len()
+        );
+    }
+
+    fn outcome_head(outcome: &TaskOutcome) -> &str {
+        match outcome {
+            TaskOutcome::Completed(report) => report.head.as_str(),
+            TaskOutcome::Skipped(report) => report.head.as_str(),
+        }
+    }
+
+    fn outcome_label_name(outcome: &TaskOutcome) -> &str {
+        match outcome {
+            TaskOutcome::Completed(report) => report.label_name.as_str(),
+            TaskOutcome::Skipped(report) => report.label_name.as_str(),
+        }
+    }
+
+    /// Run the real `run_experiment` against a prepared data dir and assert the
+    /// dataset-agnostic invariants: artifacts written, every download skipped,
+    /// outcomes and the results log line up, and at least one task completes.
+    async fn run_pipeline(tag: &str, data_dir: &Path, dataset: DatasetName) -> ExperimentSummary {
+        let output_dir = temp_dir(tag);
+        let mut config = baseline_config();
+        config.dataset = dataset;
+        config.data_dir = data_dir.to_path_buf();
+        config.output_dir = output_dir.clone();
+        config.max_labels_per_head = Some(3);
+        config.min_train_positives = 1;
+        config.min_test_positives = 1;
+        config.max_negatives_per_label = 256;
+        config.population_size = 16;
+        config.generation_limit = 6;
+        config.stagnation_limit = 3;
+        config.leaderboard_size = 4;
+        config.rng_seed = Some(7);
+
+        let summary = ok(run_experiment(&config).await);
+
+        assert_eq!(
+            summary.completed_tasks + summary.skipped_tasks,
+            summary.outcomes.len()
+        );
+        assert!(summary.completed_tasks >= 1);
+        for file in &summary.downloaded_files {
+            assert!(file.skipped);
+        }
+        for name in [
+            "summary.json",
+            "results.jsonl",
+            "experiment-config.json",
+            "downloaded-files.json",
+        ] {
+            let metadata = ok(std::fs::metadata(output_dir.join(name)));
+            assert!(metadata.len() > 0);
+        }
+        let results = ok(std::fs::read_to_string(output_dir.join("results.jsonl")));
+        let line_count = results.lines().filter(|line| !line.is_empty()).count();
+        assert_eq!(line_count, summary.outcomes.len());
+        let summary_text = ok(std::fs::read_to_string(output_dir.join("summary.json")));
+        let value: serde_json::Value = ok(serde_json::from_str(&summary_text));
+        assert!(value.get("completed_tasks").is_some());
+        assert!(value.get("outcomes").is_some());
+
+        let _ = std::fs::remove_dir_all(&output_dir);
+        summary
+    }
+
+    #[tokio::test]
+    async fn smoke_run_npclassifier_end_to_end() {
+        let data_dir = temp_dir("smoke-npc-data");
+        let vocabulary = "{\"pathway\":[\"p0\"],\"superclass\":[\"s0\"],\"class\":[\"c0\",\"c1\"]}";
+        let train: &[TestSplitRow] = &[
+            ("CCN", 1, vec![vec![0], vec![0], vec![0]]),
+            ("CCO", 2, vec![vec![0], vec![0], vec![0]]),
+            ("CCC", 3, vec![vec![], vec![], vec![0]]),
+            ("CCCC", 4, vec![vec![], vec![], vec![0]]),
+            ("c1ccccc1", 5, vec![vec![], vec![], vec![1]]),
+            ("O", 6, vec![vec![], vec![], vec![]]),
+            ("N", 7, vec![vec![], vec![], vec![]]),
+            ("CO", 8, vec![vec![], vec![], vec![]]),
+        ];
+        let validation: &[TestSplitRow] = &[
+            ("CN", 9, vec![vec![0], vec![0], vec![0]]),
+            ("CC", 10, vec![vec![], vec![], vec![]]),
+        ];
+        let test: &[TestSplitRow] = &[
+            ("CCN", 11, vec![vec![0], vec![0], vec![0]]),
+            ("CCO", 12, vec![vec![], vec![], vec![]]),
+        ];
+        populate_dataset_dir(
+            &data_dir,
+            &NPCLASSIFIER_DATASET,
+            &NPC_HEADS,
+            vocabulary,
+            train,
+            validation,
+            test,
+        );
+
+        let summary = run_pipeline("smoke-npc-out", &data_dir, DatasetName::Npclassifier).await;
+        assert_eq!(summary.dataset_record_id, 19_701_295);
+        for outcome in &summary.outcomes {
+            assert!(NPC_HEADS.contains(&outcome_head(outcome)));
+        }
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn smoke_run_classyfire_end_to_end() {
+        const HEADS: [&str; 9] = [
+            "kingdom",
+            "superclass",
+            "class",
+            "subclass",
+            "direct_parent",
+            "intermediate_nodes",
+            "alternative_parents",
+            "substituents",
+            "mapped_features",
+        ];
+        let data_dir = temp_dir("smoke-cf-data");
+        let vocabulary = "{\"kingdom\":[\"k0\",\"k1\"],\"superclass\":[\"sc0\"],\"class\":[\"cl0\"],\"subclass\":[],\"direct_parent\":[\"d0\"],\"intermediate_nodes\":[\"i0\"],\"alternative_parents\":[\"a0\",\"a1\"],\"substituents\":[\"su0\"],\"mapped_features\":[\"m0\"]}";
+        // kingdom (index 0), direct_parent (4), alternative_parents (6, multi-label).
+        // The remaining heads stay empty so they plan no tasks.
+        let row = |smiles: &'static str,
+                   cid: i64,
+                   kingdom: Vec<u16>,
+                   direct_parent: Vec<u16>,
+                   alternative_parents: Vec<u16>|
+         -> TestSplitRow {
+            let mut ids = vec![Vec::new(); HEADS.len()];
+            ids[0] = kingdom;
+            ids[4] = direct_parent;
+            ids[6] = alternative_parents;
+            (smiles, cid, ids)
+        };
+        let train = [
+            row("CCN", 1, vec![0], vec![0], vec![0]),
+            row("CCO", 2, vec![0], vec![0], vec![0, 1]),
+            row("CCC", 3, vec![0], vec![0], vec![1]),
+            row("CN", 4, vec![1], vec![], vec![]),
+            row("O", 5, vec![], vec![], vec![]),
+            row("N", 6, vec![], vec![], vec![]),
+        ];
+        let validation = [
+            row("CO", 7, vec![0], vec![0], vec![0]),
+            row("CC", 8, vec![], vec![], vec![]),
+        ];
+        let test = [
+            row("CCN", 9, vec![0], vec![0], vec![0]),
+            row("CCO", 10, vec![], vec![], vec![]),
+        ];
+        populate_dataset_dir(
+            &data_dir,
+            &CLASSYFIRE_DATASET,
+            &HEADS,
+            vocabulary,
+            &train,
+            &validation,
+            &test,
+        );
+
+        let summary = run_pipeline("smoke-cf-out", &data_dir, DatasetName::Classyfire).await;
+        assert_eq!(summary.dataset_record_id, 20_472_700);
+        let distinct: std::collections::HashSet<&str> =
+            summary.outcomes.iter().map(outcome_head).collect();
+        assert!(distinct.len() >= 2);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn resume_skips_labels_already_in_results_log() {
+        let data_dir = temp_dir("resume-data");
+        let output_dir = temp_dir("resume-out");
+        let vocabulary = "{\"pathway\":[\"p0\"],\"superclass\":[\"s0\"],\"class\":[\"c0\",\"c1\"]}";
+        let train: &[TestSplitRow] = &[
+            ("CCN", 1, vec![vec![0], vec![0], vec![0]]),
+            ("CCO", 2, vec![vec![0], vec![0], vec![0]]),
+            ("CCC", 3, vec![vec![], vec![], vec![0]]),
+            ("CCCC", 4, vec![vec![], vec![], vec![0]]),
+            ("c1ccccc1", 5, vec![vec![], vec![], vec![1]]),
+            ("O", 6, vec![vec![], vec![], vec![]]),
+            ("N", 7, vec![vec![], vec![], vec![]]),
+            ("CO", 8, vec![vec![], vec![], vec![]]),
+        ];
+        let validation: &[TestSplitRow] = &[
+            ("CN", 9, vec![vec![0], vec![0], vec![0]]),
+            ("CC", 10, vec![vec![], vec![], vec![]]),
+        ];
+        let test: &[TestSplitRow] = &[
+            ("CCN", 11, vec![vec![0], vec![0], vec![0]]),
+            ("CCO", 12, vec![vec![], vec![], vec![]]),
+        ];
+        populate_dataset_dir(
+            &data_dir,
+            &NPCLASSIFIER_DATASET,
+            &NPC_HEADS,
+            vocabulary,
+            train,
+            validation,
+            test,
+        );
+
+        let mut config = baseline_config();
+        config.dataset = DatasetName::Npclassifier;
+        config.data_dir = data_dir.clone();
+        config.output_dir = output_dir.clone();
+        config.max_labels_per_head = Some(3);
+        config.min_train_positives = 1;
+        config.min_test_positives = 1;
+        config.max_negatives_per_label = 256;
+        config.population_size = 12;
+        config.generation_limit = 2;
+        config.stagnation_limit = 2;
+        config.leaderboard_size = 4;
+        config.rng_seed = Some(7);
+
+        let results_path = output_dir.join("results.jsonl");
+
+        // First run records every planned label.
+        let first = ok(run_experiment(&config).await);
+        let total = first.outcomes.len();
+        assert!(total >= 2);
+
+        // Rewrite the log keeping all but the last label, and rename the kept ones
+        // to a sentinel. A resumed (loaded) outcome keeps the sentinel name, while a
+        // re-evolved one would carry the real vocabulary name, so this distinguishes
+        // a real skip from an accidental re-run.
+        let recorded = ok(std::fs::read_to_string(&results_path));
+        let mut lines: Vec<&str> = recorded
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        lines.pop();
+        let mut tampered = String::new();
+        for line in &lines {
+            let mut value: serde_json::Value = ok(serde_json::from_str(line));
+            if let Some(object) = value.as_object_mut() {
+                for inner in object.values_mut() {
+                    if let Some(report) = inner.as_object_mut() {
+                        report.insert(
+                            "label_name".to_owned(),
+                            serde_json::Value::String("RESUMED_MARKER".to_owned()),
+                        );
+                    }
+                }
+            }
+            tampered.push_str(&ok(serde_json::to_string(&value)));
+            tampered.push('\n');
+        }
+        assert!(std::fs::write(&results_path, &tampered).is_ok());
+
+        // Resume: the recorded labels are skipped (sentinel survives), the one
+        // dropped label is re-run (real name), and the total is unchanged.
+        let second = ok(run_experiment(&config).await);
+        assert_eq!(second.outcomes.len(), total);
+        let resumed = second
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome_label_name(outcome) == "RESUMED_MARKER")
+            .count();
+        let rerun = second
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome_label_name(outcome) != "RESUMED_MARKER")
+            .count();
+        assert_eq!(resumed, total - 1);
+        assert_eq!(rerun, 1);
+
+        // A fresh run ignores the log and re-evolves everything, so no sentinel
+        // survives.
+        config.fresh = true;
+        let third = ok(run_experiment(&config).await);
+        assert_eq!(third.outcomes.len(), total);
+        assert!(
+            third
+                .outcomes
+                .iter()
+                .all(|outcome| outcome_label_name(outcome) != "RESUMED_MARKER")
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local dataset files. Run with `cargo test -- --ignored` before release"]
+    async fn real_data_smoke_run() {
+        real_data_case(
+            "data/classyfire-splits",
+            &CLASSYFIRE_DATASET,
+            DatasetName::Classyfire,
+            20_472_700,
+        )
+        .await;
+        real_data_case(
+            "data",
+            &NPCLASSIFIER_DATASET,
+            DatasetName::Npclassifier,
+            19_701_295,
+        )
+        .await;
+    }
+
+    /// Slice a subset of one real dataset's local files into a temp dir and run
+    /// the pipeline against the real schema. Skips quietly if the files are
+    /// absent so the test is a no-op on machines without the data.
+    async fn real_data_case(
+        src_dir: &str,
+        spec: &DatasetSpec,
+        dataset: DatasetName,
+        record_id: u64,
+    ) {
+        let src = Path::new(src_dir);
+        let required = [
+            "vocabulary.json",
+            "train.parquet",
+            "validation.parquet",
+            "test.parquet",
+        ];
+        if required.iter().any(|name| !src.join(name).exists()) {
+            eprintln!("real_data_smoke_run: skipping {src_dir} (dataset files absent)");
+            return;
+        }
+        let data_dir = temp_dir(&format!("smoke-real-{record_id}"));
+        assert!(
+            std::fs::copy(
+                src.join("vocabulary.json"),
+                data_dir.join("vocabulary.json")
+            )
+            .is_ok()
+        );
+        slice_parquet(
+            &src.join("train.parquet"),
+            &data_dir.join("train.parquet"),
+            40_000,
+        );
+        slice_parquet(
+            &src.join("validation.parquet"),
+            &data_dir.join("validation.parquet"),
+            8_000,
+        );
+        slice_parquet(
+            &src.join("test.parquet"),
+            &data_dir.join("test.parquet"),
+            8_000,
+        );
+        touch_missing_spec_files(&data_dir, spec);
+
+        let summary =
+            run_pipeline(&format!("smoke-real-out-{record_id}"), &data_dir, dataset).await;
+        assert_eq!(summary.dataset_record_id, record_id);
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

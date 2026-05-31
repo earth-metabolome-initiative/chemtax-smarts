@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use arrow_array::cast::{as_list_array, as_primitive_array, as_string_array};
 use arrow_array::types::Int64Type;
 use arrow_array::{Array, RecordBatch, UInt16Array};
+use indexmap::IndexMap;
 use indicatif::ProgressBar;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
@@ -16,6 +17,7 @@ use smarts_rs::PreparedTarget;
 use smiles_parser::Smiles;
 
 use crate::experiment::ExperimentError;
+use crate::util::usize_to_u64;
 
 const FOLD_PROGRESS_GRANULARITY: usize = 8_192;
 
@@ -27,33 +29,35 @@ fn sample_limit_label(limit: usize) -> String {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LabelHead {
-    Pathway,
-    Superclass,
-    Class,
-}
+/// A handle to one label head, identified by its position in the dataset's
+/// ordered head set (the key order of `vocabulary.json`). Head names and labels
+/// live in [`Vocabulary`], so the handle itself is a `Copy` index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LabelHead(usize);
 
 impl LabelHead {
-    pub const ALL: [Self; 3] = [Self::Pathway, Self::Superclass, Self::Class];
-
+    /// Build a head handle from its position in the canonical head order.
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pathway => "pathway",
-            Self::Superclass => "superclass",
-            Self::Class => "class",
-        }
+    pub const fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    /// Position of this head in the canonical head order.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.0
     }
 }
 
+/// Ordered label vocabulary loaded from the dataset's `vocabulary.json`. The JSON
+/// is an object mapping each head name to its ordered list of label names. The
+/// key order defines the canonical head order, and [`LabelHead`] handles index
+/// into it. This shape supports any head set the dataset declares, so the same
+/// code reads the 3-head `NPClassifier` vocabulary and the 9-head `ClassyFire` one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Vocabulary {
-    pub pathway: Vec<String>,
-    pub superclass: Vec<String>,
-    #[serde(rename = "class")]
-    pub class_labels: Vec<String>,
+    heads: IndexMap<String, Vec<String>>,
 }
 
 impl Vocabulary {
@@ -61,42 +65,83 @@ impl Vocabulary {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be read or if the JSON payload does
-    /// not match the expected schema.
+    /// Returns an error if the file cannot be read or if the JSON payload is not
+    /// an object mapping head names to label-name arrays.
     pub fn load(path: &Path) -> Result<Self, ExperimentError> {
         Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
     }
 
+    /// Build a vocabulary from ordered (head name, labels) pairs.
+    #[must_use]
+    pub fn from_pairs<I, S, L>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (S, L)>,
+        S: Into<String>,
+        L: IntoIterator,
+        L::Item: Into<String>,
+    {
+        let heads = pairs
+            .into_iter()
+            .map(|(name, labels)| (name.into(), labels.into_iter().map(Into::into).collect()))
+            .collect();
+        Self { heads }
+    }
+
+    /// Number of heads the dataset declares.
+    #[must_use]
+    pub fn head_count(&self) -> usize {
+        self.heads.len()
+    }
+
+    /// Iterate the head handles in canonical order.
+    pub fn heads(&self) -> impl Iterator<Item = LabelHead> {
+        (0..self.heads.len()).map(LabelHead::new)
+    }
+
+    /// Ordered head names, used to resolve the `{head}_ids` parquet columns.
+    #[must_use]
+    pub fn head_names(&self) -> Vec<String> {
+        self.heads.keys().cloned().collect()
+    }
+
+    /// Name of one head, or `""` if the handle is out of range.
+    #[must_use]
+    pub fn head_name(&self, head: LabelHead) -> &str {
+        self.heads
+            .get_index(head.index())
+            .map_or("", |(name, _)| name.as_str())
+    }
+
+    /// Ordered label names of one head, or an empty slice if the handle is out of range.
     #[must_use]
     pub fn labels(&self, head: LabelHead) -> &[String] {
-        match head {
-            LabelHead::Pathway => &self.pathway,
-            LabelHead::Superclass => &self.superclass,
-            LabelHead::Class => &self.class_labels,
-        }
+        self.heads
+            .get_index(head.index())
+            .map_or(&[], |(_, labels)| labels.as_slice())
     }
 }
 
+/// One loaded dataset row: a molecule and its label ids per head.
 #[derive(Clone)]
 pub struct SplitRow {
+    /// `PubChem` compound id of the molecule.
     pub cid: i64,
+    /// `SMILES` string of the molecule.
     pub smiles: String,
-    pub pathway_ids: Vec<u16>,
-    pub superclass_ids: Vec<u16>,
-    pub class_ids: Vec<u16>,
+    /// Label ids per head, indexed by [`LabelHead::index`]. The outer order
+    /// matches the dataset's [`Vocabulary`] head order.
+    pub head_ids: Vec<Vec<u16>>,
 }
 
 impl SplitRow {
+    /// Label ids for one head, or an empty slice if the handle is out of range.
     #[must_use]
     pub fn labels(&self, head: LabelHead) -> &[u16] {
-        match head {
-            LabelHead::Pathway => &self.pathway_ids,
-            LabelHead::Superclass => &self.superclass_ids,
-            LabelHead::Class => &self.class_ids,
-        }
+        self.head_ids.get(head.index()).map_or(&[], Vec::as_slice)
     }
 }
 
+/// One named dataset split (train, validation, or test) holding its loaded rows.
 #[derive(Clone)]
 pub struct DatasetSplit {
     name: String,
@@ -111,9 +156,13 @@ impl DatasetSplit {
     /// Returns an error if the parquet file cannot be read, if required columns
     /// are missing, if labels are malformed, or if any SMILES row cannot be
     /// parsed into the in-memory row representation.
-    pub fn load(path: &Path, name: impl Into<String>) -> Result<Self, ExperimentError> {
+    pub fn load(
+        path: &Path,
+        name: impl Into<String>,
+        head_names: &[String],
+    ) -> Result<Self, ExperimentError> {
         let progress_bar = ProgressBar::hidden();
-        Self::load_with_progress(path, name, &progress_bar)
+        Self::load_with_progress(path, name, head_names, &progress_bar)
     }
 
     /// Load one published parquet split while updating a progress bar by row.
@@ -126,6 +175,7 @@ impl DatasetSplit {
     pub fn load_with_progress(
         path: &Path,
         name: impl Into<String>,
+        head_names: &[String],
         progress_bar: &ProgressBar,
     ) -> Result<Self, ExperimentError> {
         let name = name.into();
@@ -147,7 +197,7 @@ impl DatasetSplit {
             let batch =
                 batch.map_err(|error| ExperimentError::InvalidDataset(error.to_string()))?;
             progress_bar.set_message(format!("{name} | loading raw rows"));
-            let prepared_rows = prepare_batch_rows(&batch, &name)?;
+            let prepared_rows = prepare_batch_rows(&batch, &name, head_names)?;
             progress_bar.inc(usize_to_u64(prepared_rows.len()));
             rows.extend(prepared_rows);
         }
@@ -159,6 +209,7 @@ impl DatasetSplit {
         Ok(Self { name, rows })
     }
 
+    /// Merge several splits into one named split, preserving row order.
     #[must_use]
     pub fn concatenate(name: impl Into<String>, splits: Vec<Self>) -> Self {
         let row_count = splits.iter().map(Self::len).sum();
@@ -172,26 +223,31 @@ impl DatasetSplit {
         }
     }
 
+    /// Name of this split.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// Loaded rows of this split.
     #[must_use]
     pub fn rows(&self) -> &[SplitRow] {
         &self.rows
     }
 
+    /// Number of rows in this split.
     #[must_use]
     pub fn len(&self) -> usize {
         self.rows.len()
     }
 
+    /// Whether this split has no rows.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 
+    /// Count rows carrying each label id of one head, indexed by label id.
     #[must_use]
     pub fn label_positive_counts(&self, head: LabelHead, label_count: usize) -> Vec<usize> {
         let mut counts = vec![0usize; label_count];
@@ -213,10 +269,11 @@ impl DatasetSplit {
     pub fn build_fold(
         &self,
         head: LabelHead,
+        head_name: &str,
         label_id: u16,
     ) -> Result<LabeledFold, ExperimentError> {
         let progress_bar = ProgressBar::hidden();
-        self.build_fold_with_progress(head, label_id, &progress_bar)
+        self.build_fold_with_progress(head, head_name, label_id, &progress_bar)
     }
 
     /// Build an unsampled labeled evaluation set with progress.
@@ -227,16 +284,27 @@ impl DatasetSplit {
     pub fn build_fold_with_progress(
         &self,
         head: LabelHead,
+        head_name: &str,
         label_id: u16,
         progress_bar: &ProgressBar,
     ) -> Result<LabeledFold, ExperimentError> {
-        self.build_sampled_fold_with_progress(head, label_id, usize::MAX, usize::MAX, progress_bar)
+        self.build_sampled_fold_with_progress(
+            head,
+            head_name,
+            label_id,
+            usize::MAX,
+            usize::MAX,
+            progress_bar,
+        )
     }
 
+    /// Count the positives and negatives a sampled fold would select, without
+    /// parsing any SMILES.
     #[must_use]
     pub fn sampled_counts_with_progress(
         &self,
         head: LabelHead,
+        head_name: &str,
         label_id: u16,
         max_positives_per_class: usize,
         max_negatives_per_class: usize,
@@ -244,6 +312,7 @@ impl DatasetSplit {
     ) -> FoldSelectionCounts {
         let selection = self.select_sample_indices(
             head,
+            head_name,
             label_id,
             max_positives_per_class,
             max_negatives_per_class,
@@ -263,6 +332,7 @@ impl DatasetSplit {
     pub fn build_sampled_fold_with_progress(
         &self,
         head: LabelHead,
+        head_name: &str,
         label_id: u16,
         max_positives_per_class: usize,
         max_negatives_per_class: usize,
@@ -274,6 +344,7 @@ impl DatasetSplit {
             negative_count,
         } = self.select_sample_indices(
             head,
+            head_name,
             label_id,
             max_positives_per_class,
             max_negatives_per_class,
@@ -282,10 +353,9 @@ impl DatasetSplit {
         progress_bar.set_length(usize_to_u64(indices.len()));
         progress_bar.set_position(0);
         progress_bar.set_message(format!(
-            "{} | preparing {} selected {}:{label_id} targets",
+            "{} | preparing {} selected {head_name}:{label_id} targets",
             self.name,
             indices.len(),
-            head.as_str()
         ));
 
         let completed_count = AtomicUsize::new(0);
@@ -307,10 +377,9 @@ impl DatasetSplit {
         drop(indices);
 
         progress_bar.set_message(format!(
-            "{} | indexing {} selected {}:{label_id} targets",
+            "{} | indexing {} selected {head_name}:{label_id} targets",
             self.name,
             samples.len(),
-            head.as_str()
         ));
         progress_bar.tick();
         Ok(LabeledFold {
@@ -323,6 +392,7 @@ impl DatasetSplit {
     fn select_sample_indices(
         &self,
         head: LabelHead,
+        head_name: &str,
         label_id: u16,
         max_positives_per_class: usize,
         max_negatives_per_class: usize,
@@ -334,9 +404,8 @@ impl DatasetSplit {
         let max_positives_label = sample_limit_label(max_positives_per_class);
         let max_negatives_label = sample_limit_label(max_negatives_per_class);
         progress_bar.set_message(format!(
-            "{} | selecting {}:{label_id} evaluation rows | max_positives_per_class={max_positives_label} max_negatives_per_class={max_negatives_label}",
+            "{} | selecting {head_name}:{label_id} evaluation rows | max_positives_per_class={max_positives_label} max_negatives_per_class={max_negatives_label}",
             self.name,
-            head.as_str()
         ));
 
         let mut all_positive_indices = Vec::new();
@@ -352,6 +421,7 @@ impl DatasetSplit {
                     push_sample_candidates(
                         &mut positive_buckets,
                         row,
+                        head,
                         row_index,
                         max_positives_per_class,
                     );
@@ -362,6 +432,7 @@ impl DatasetSplit {
                 push_sample_candidates(
                     &mut negative_buckets,
                     row,
+                    head,
                     row_index,
                     max_negatives_per_class,
                 );
@@ -402,16 +473,23 @@ impl DatasetSplit {
     }
 }
 
+/// A prepared evaluation fold with its selected positive and negative counts.
 #[derive(Clone)]
 pub struct LabeledFold {
+    /// Prepared match targets for every selected row.
     pub fold: FoldData,
+    /// Number of selected rows carrying the target label.
     pub positive_count: usize,
+    /// Number of selected rows not carrying the target label.
     pub negative_count: usize,
 }
 
+/// Positive and negative row counts a fold selection produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FoldSelectionCounts {
+    /// Number of selected rows carrying the target label.
     pub positive_count: usize,
+    /// Number of selected rows not carrying the target label.
     pub negative_count: usize,
 }
 
@@ -441,13 +519,19 @@ impl PartialOrd for RankedIndex {
     }
 }
 
+// Negatives (and capped positives) are stratified by the label ids of the head
+// currently being trained, so the per-class cap spreads the sample across that
+// head's labels. Rows with no label in this head fall into a single `None`
+// bucket.
 fn push_sample_candidates(
     buckets: &mut HashMap<Option<u16>, BinaryHeap<RankedIndex>>,
     row: &SplitRow,
+    head: LabelHead,
     row_index: usize,
     max_per_class: usize,
 ) {
-    if row.class_ids.is_empty() {
+    let ids = row.labels(head);
+    if ids.is_empty() {
         push_sample_candidate(
             buckets,
             None,
@@ -460,12 +544,12 @@ fn push_sample_candidates(
         return;
     }
 
-    for &class_id in &row.class_ids {
+    for &id in ids {
         push_sample_candidate(
             buckets,
-            Some(class_id),
+            Some(id),
             RankedIndex {
-                score: sample_score(row, row_index, Some(class_id)),
+                score: sample_score(row, row_index, Some(id)),
                 index: row_index,
             },
             max_per_class,
@@ -568,26 +652,31 @@ impl LabelColumnView<'_> {
 struct RawSplitRow {
     cid: i64,
     smiles: String,
-    pathway_ids: Vec<u16>,
-    superclass_ids: Vec<u16>,
-    class_ids: Vec<u16>,
+    head_ids: Vec<Vec<u16>>,
 }
 
-fn prepare_batch_rows(batch: &RecordBatch, split: &str) -> Result<Vec<SplitRow>, ExperimentError> {
+fn prepare_batch_rows(
+    batch: &RecordBatch,
+    split: &str,
+    head_names: &[String],
+) -> Result<Vec<SplitRow>, ExperimentError> {
     let smiles_array = as_string_array(column(batch, split, "smiles")?);
     let cid_array = as_primitive_array::<Int64Type>(column(batch, split, "cid")?);
-    let pathway_view = label_column(batch, split, "pathway_ids")?;
-    let superclass_view = label_column(batch, split, "superclass_ids")?;
-    let class_view = label_column(batch, split, "class_ids")?;
+    let head_views = head_names
+        .iter()
+        .map(|name| label_column(batch, split, &format!("{name}_ids")))
+        .collect::<Result<Vec<_>, ExperimentError>>()?;
 
     let raw_rows = (0..batch.num_rows())
         .map(|row_index| {
+            let head_ids = head_views
+                .iter()
+                .map(|view| view.values(row_index))
+                .collect::<Result<Vec<_>, ExperimentError>>()?;
             Ok(RawSplitRow {
                 cid: cid_array.value(row_index),
                 smiles: smiles_array.value(row_index).to_owned(),
-                pathway_ids: pathway_view.values(row_index)?,
-                superclass_ids: superclass_view.values(row_index)?,
-                class_ids: class_view.values(row_index)?,
+                head_ids,
             })
         })
         .collect::<Result<Vec<_>, ExperimentError>>()?;
@@ -599,16 +688,12 @@ fn prepare_raw_row(row: RawSplitRow) -> SplitRow {
     let RawSplitRow {
         cid,
         smiles,
-        pathway_ids,
-        superclass_ids,
-        class_ids,
+        head_ids,
     } = row;
     SplitRow {
         cid,
         smiles,
-        pathway_ids,
-        superclass_ids,
-        class_ids,
+        head_ids,
     }
 }
 
@@ -635,129 +720,46 @@ fn prepare_fold_sample(
     }
 }
 
-fn usize_to_u64(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use arrow_array::{Int64Array, ListArray, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
-    use parquet::arrow::ArrowWriter;
-
     use super::*;
-
-    type TestSplitRow = (&'static str, i64, Vec<u16>, Vec<u16>, Vec<u16>);
-
-    fn write_split_parquet(path: &Path, rows: &[TestSplitRow]) {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("cid", DataType::Int64, false),
-            Field::new("smiles", DataType::Utf8, false),
-            Field::new(
-                "pathway_ids",
-                DataType::List(Arc::new(Field::new("item", DataType::UInt16, true))),
-                false,
-            ),
-            Field::new(
-                "superclass_ids",
-                DataType::List(Arc::new(Field::new("item", DataType::UInt16, true))),
-                false,
-            ),
-            Field::new(
-                "class_ids",
-                DataType::List(Arc::new(Field::new("item", DataType::UInt16, true))),
-                false,
-            ),
-        ]));
-        let cids = rows
-            .iter()
-            .map(|(_, cid, _, _, _)| *cid)
-            .collect::<Int64Array>();
-        let smiles = StringArray::from_iter_values(rows.iter().map(|(smiles, _, _, _, _)| *smiles));
-        let pathway_ids = ListArray::from_iter_primitive::<arrow_array::types::UInt16Type, _, _>(
-            rows.iter()
-                .map(|(_, _, pathway, _, _)| Some(pathway.iter().copied().map(Some))),
-        );
-        let superclass_ids = ListArray::from_iter_primitive::<arrow_array::types::UInt16Type, _, _>(
-            rows.iter()
-                .map(|(_, _, _, superclass, _)| Some(superclass.iter().copied().map(Some))),
-        );
-        let class_ids = ListArray::from_iter_primitive::<arrow_array::types::UInt16Type, _, _>(
-            rows.iter()
-                .map(|(_, _, _, _, class_ids)| Some(class_ids.iter().copied().map(Some))),
-        );
-        let batch_result = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![
-                Arc::new(cids),
-                Arc::new(smiles),
-                Arc::new(pathway_ids),
-                Arc::new(superclass_ids),
-                Arc::new(class_ids),
-            ],
-        );
-        assert!(batch_result.is_ok());
-
-        let file_result = File::create(path);
-        assert!(file_result.is_ok());
-        let Ok(file) = file_result else {
-            unreachable!()
-        };
-        let writer_result = ArrowWriter::try_new(file, Arc::clone(&schema), None);
-        assert!(writer_result.is_ok());
-        let Ok(mut writer) = writer_result else {
-            unreachable!()
-        };
-        let Ok(batch) = batch_result else {
-            unreachable!()
-        };
-        let batch_write_result = writer.write(&batch);
-        assert!(batch_write_result.is_ok());
-        let close_result = writer.close();
-        assert!(close_result.is_ok());
-    }
+    use crate::test_support::{
+        NPC_HEADS, TestSplitRow, head_names, ok, temp_dir, write_split_parquet,
+    };
 
     #[test]
     fn dataset_split_loads_rows_and_builds_binary_fold() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "npc-smarts-dataset-load-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        let create_dir_result = std::fs::create_dir_all(&temp_dir);
-        assert!(create_dir_result.is_ok());
+        let temp_dir = temp_dir("dataset-load-test");
 
         let split_path = temp_dir.join("train.parquet");
         write_split_parquet(
             &split_path,
+            &NPC_HEADS,
             &[
-                ("CCN", 1, vec![0], vec![1], vec![2]),
-                ("CCO", 2, vec![], vec![], vec![]),
-                ("NC", 3, vec![0], vec![1], vec![2]),
+                ("CCN", 1, vec![vec![0], vec![1], vec![2]]),
+                ("CCO", 2, vec![vec![], vec![], vec![]]),
+                ("NC", 3, vec![vec![0], vec![1], vec![2]]),
             ],
         );
 
-        let loaded = DatasetSplit::load(&split_path, "train");
-        assert!(loaded.is_ok());
-        let Ok(loaded) = loaded else { unreachable!() };
+        let pathway = LabelHead::new(0);
+        let class = LabelHead::new(2);
+        let loaded = ok(DatasetSplit::load(
+            &split_path,
+            "train",
+            &head_names(&NPC_HEADS),
+        ));
         assert_eq!(loaded.name(), "train");
         assert_eq!(loaded.len(), 3);
         assert!(!loaded.is_empty());
         assert_eq!(loaded.rows()[0].cid, 1);
         assert_eq!(loaded.rows()[0].smiles, "CCN");
-        assert_eq!(loaded.rows()[0].labels(LabelHead::Class), &[2]);
-        assert!(loaded.rows()[1].labels(LabelHead::Pathway).is_empty());
-        assert_eq!(
-            loaded.label_positive_counts(LabelHead::Class, 4),
-            vec![0, 0, 2, 0]
-        );
-        assert_eq!(loaded.label_positive_counts(LabelHead::Pathway, 1), vec![2]);
+        assert_eq!(loaded.rows()[0].labels(class), &[2]);
+        assert!(loaded.rows()[1].labels(pathway).is_empty());
+        assert_eq!(loaded.label_positive_counts(class, 4), vec![0, 0, 2, 0]);
+        assert_eq!(loaded.label_positive_counts(pathway, 1), vec![2]);
 
-        let fold = loaded.build_fold(LabelHead::Class, 2);
-        assert!(fold.is_ok());
-        let Ok(fold) = fold else { unreachable!() };
+        let fold = ok(loaded.build_fold(class, "class", 2));
         assert_eq!(fold.positive_count, 2);
         assert_eq!(fold.negative_count, 1);
         assert_eq!(fold.fold.len(), 3);
@@ -767,34 +769,32 @@ mod tests {
 
     #[test]
     fn sampled_fold_caps_positives_and_negatives_by_class() {
-        let temp_dir = std::env::temp_dir().join(format!(
-            "npc-smarts-dataset-sampling-test-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        let create_dir_result = std::fs::create_dir_all(&temp_dir);
-        assert!(create_dir_result.is_ok());
+        let temp_dir = temp_dir("dataset-sampling-test");
 
         let split_path = temp_dir.join("train.parquet");
         write_split_parquet(
             &split_path,
+            &NPC_HEADS,
             &[
-                ("CCN", 1, vec![], vec![], vec![0]),
-                ("CN", 2, vec![], vec![], vec![0]),
-                ("CCO", 3, vec![], vec![], vec![1]),
-                ("CO", 4, vec![], vec![], vec![1]),
-                ("CCC", 5, vec![], vec![], vec![2]),
-                ("CC", 6, vec![], vec![], vec![2]),
-                ("O", 7, vec![], vec![], vec![]),
-                ("N", 8, vec![], vec![], vec![]),
+                ("CCN", 1, vec![vec![], vec![], vec![0]]),
+                ("CN", 2, vec![vec![], vec![], vec![0]]),
+                ("CCO", 3, vec![vec![], vec![], vec![1]]),
+                ("CO", 4, vec![vec![], vec![], vec![1]]),
+                ("CCC", 5, vec![vec![], vec![], vec![2]]),
+                ("CC", 6, vec![vec![], vec![], vec![2]]),
+                ("O", 7, vec![vec![], vec![], vec![]]),
+                ("N", 8, vec![vec![], vec![], vec![]]),
             ],
         );
 
-        let loaded = DatasetSplit::load(&split_path, "train");
-        assert!(loaded.is_ok());
-        let Ok(loaded) = loaded else { unreachable!() };
+        let class = LabelHead::new(2);
+        let loaded = ok(DatasetSplit::load(
+            &split_path,
+            "train",
+            &head_names(&NPC_HEADS),
+        ));
         let progress_bar = ProgressBar::hidden();
-        let counts = loaded.sampled_counts_with_progress(LabelHead::Class, 0, 1, 1, &progress_bar);
+        let counts = loaded.sampled_counts_with_progress(class, "class", 0, 1, 1, &progress_bar);
         assert_eq!(
             counts,
             FoldSelectionCounts {
@@ -804,9 +804,7 @@ mod tests {
         );
 
         let fold =
-            loaded.build_sampled_fold_with_progress(LabelHead::Class, 0, 1, 1, &progress_bar);
-        assert!(fold.is_ok());
-        let Ok(fold) = fold else { unreachable!() };
+            ok(loaded.build_sampled_fold_with_progress(class, "class", 0, 1, 1, &progress_bar));
         assert_eq!(fold.positive_count, 1);
         assert_eq!(fold.negative_count, 3);
         assert_eq!(fold.fold.len(), 4);
@@ -815,34 +813,90 @@ mod tests {
     }
 
     #[test]
-    fn vocabulary_load_and_label_lookup_follow_head_selection() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("npc-smarts-vocabulary-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp_dir);
-        let create_dir_result = std::fs::create_dir_all(&temp_dir);
-        assert!(create_dir_result.is_ok());
+    fn vocabulary_load_preserves_head_order_and_labels() {
+        let temp_dir = temp_dir("vocabulary-test");
 
         let vocabulary_path = temp_dir.join("vocabulary.json");
-        let write_result = std::fs::write(
+        ok(std::fs::write(
             &vocabulary_path,
             "{\n  \"pathway\": [\"p0\"],\n  \"superclass\": [\"s0\", \"s1\"],\n  \"class\": [\"c0\", \"c1\", \"c2\"]\n}\n",
-        );
-        assert!(write_result.is_ok());
+        ));
 
-        let loaded = Vocabulary::load(&vocabulary_path);
-        assert!(loaded.is_ok());
-        let Ok(loaded) = loaded else { unreachable!() };
-        assert_eq!(loaded.labels(LabelHead::Pathway), ["p0"]);
-        assert_eq!(loaded.labels(LabelHead::Superclass), ["s0", "s1"]);
-        assert_eq!(loaded.labels(LabelHead::Class), ["c0", "c1", "c2"]);
+        let loaded = ok(Vocabulary::load(&vocabulary_path));
+        assert_eq!(loaded.head_count(), 3);
+        assert_eq!(loaded.head_names(), vec!["pathway", "superclass", "class"]);
+        assert_eq!(loaded.head_name(LabelHead::new(0)), "pathway");
+        assert_eq!(loaded.labels(LabelHead::new(0)), ["p0"]);
+        assert_eq!(loaded.labels(LabelHead::new(1)), ["s0", "s1"]);
+        assert_eq!(loaded.labels(LabelHead::new(2)), ["c0", "c1", "c2"]);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
-    fn label_heads_render_expected_names() {
-        assert_eq!(LabelHead::Pathway.as_str(), "pathway");
-        assert_eq!(LabelHead::Superclass.as_str(), "superclass");
-        assert_eq!(LabelHead::Class.as_str(), "class");
+    fn from_pairs_round_trips_head_order() {
+        let vocabulary =
+            Vocabulary::from_pairs([("pathway", vec!["p0"]), ("superclass", vec!["s0", "s1"])]);
+        assert_eq!(vocabulary.head_count(), 2);
+        let heads: Vec<&str> = vocabulary
+            .heads()
+            .map(|h| vocabulary.head_name(h))
+            .collect();
+        assert_eq!(heads, vec!["pathway", "superclass"]);
+    }
+
+    #[test]
+    fn nine_head_classyfire_shape_loads_and_builds_folds() {
+        let temp_dir = temp_dir("classyfire-shape");
+
+        let heads = [
+            "kingdom",
+            "superclass",
+            "class",
+            "subclass",
+            "direct_parent",
+            "intermediate_nodes",
+            "alternative_parents",
+            "substituents",
+            "mapped_features",
+        ];
+        // direct_parent is head index 4: a non-class head, to prove sampling and
+        // folds work off any head, not just class.
+        let direct_parent = LabelHead::new(4);
+        let row = |smiles, cid, dp: u16| -> TestSplitRow {
+            let mut ids = vec![Vec::new(); heads.len()];
+            ids[0] = vec![0]; // kingdom
+            ids[4] = vec![dp]; // direct_parent
+            (smiles, cid, ids)
+        };
+        let split_path = temp_dir.join("train.parquet");
+        write_split_parquet(
+            &split_path,
+            &heads,
+            &[
+                row("CCN", 1, 0),
+                row("CN", 2, 0),
+                row("CCO", 3, 1),
+                row("O", 4, 1),
+            ],
+        );
+
+        let loaded = ok(DatasetSplit::load(
+            &split_path,
+            "train",
+            &head_names(&heads),
+        ));
+        assert_eq!(loaded.len(), 4);
+        assert_eq!(loaded.rows()[0].head_ids.len(), 9);
+        assert_eq!(loaded.rows()[0].labels(LabelHead::new(0)), &[0]);
+        assert_eq!(loaded.rows()[0].labels(direct_parent), &[0]);
+        assert!(loaded.rows()[0].labels(LabelHead::new(2)).is_empty());
+        assert_eq!(loaded.label_positive_counts(direct_parent, 2), vec![2, 2]);
+
+        let fold = ok(loaded.build_fold(direct_parent, "direct_parent", 0));
+        assert_eq!(fold.positive_count, 2);
+        assert_eq!(fold.negative_count, 2);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
