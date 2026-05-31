@@ -1,7 +1,10 @@
+//! Command line entry point. Parses the experiment config and runs the full
+//! per-label `SMARTS` evolution sweep over the selected dataset.
+
 use clap::Parser;
 use smarts_evolution::FileLogConfig;
 
-use npc_smarts::{ExperimentConfig, run_experiment};
+use chemtax_smarts::{ExperimentConfig, run_experiment};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

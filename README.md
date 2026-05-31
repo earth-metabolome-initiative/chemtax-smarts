@@ -1,11 +1,11 @@
-# npc-smarts
+# chemtax-smarts
 
-[![CI](https://github.com/earth-metabolome-initiative/npc-smarts/actions/workflows/ci.yml/badge.svg)](https://github.com/earth-metabolome-initiative/npc-smarts/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/earth-metabolome-initiative/npc-smarts/graph/badge.svg)](https://codecov.io/gh/earth-metabolome-initiative/npc-smarts)
+[![CI](https://github.com/earth-metabolome-initiative/chemtax-smarts/actions/workflows/ci.yml/badge.svg)](https://github.com/earth-metabolome-initiative/chemtax-smarts/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/earth-metabolome-initiative/chemtax-smarts/graph/badge.svg)](https://codecov.io/gh/earth-metabolome-initiative/chemtax-smarts)
 [![Dataset DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19701295.svg)](https://doi.org/10.5281/zenodo.19701295)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`npc-smarts` downloads the distilled `NPClassifier` train/validation/test splits from Zenodo and evolves one-vs-rest SMARTS for NPC pathway, superclass, and class labels with fixed GA defaults. The published train and validation splits are merged into one training pool, and the test split is held out for reporting.
+`chemtax-smarts` downloads a chemical-taxonomy dataset from Zenodo and evolves one-vs-rest SMARTS for every label of every classification head the dataset declares, with fixed GA defaults. The head set comes from the dataset's `vocabulary.json`, so the same run handles the 3-head `NPClassifier` splits (pathway, superclass, class) and the 9-head `ClassyFire` (`ChemOnt`) splits. Choose the dataset with `--dataset npclassifier` (the default) or `--dataset classyfire`. The published train and validation splits are merged into one training pool, and the test split is held out for reporting.
 
 ## Run
 
@@ -17,7 +17,7 @@ When stdout is an interactive terminal, each label's evolution runs in the nativ
 
 Use `--dashboard` to override the auto-detection. `--dashboard always` forces the dashboard even when stdout is not detected as a terminal, and `--dashboard never` keeps the progress bars.
 
-By default, each training/test task set includes all positives and samples up to 4096 negatives per NPC class. Override negative sampling with `--max-negatives-per-npc-class`.
+By default, each training/test task set includes all positives and samples up to 4096 negatives per label of the head being trained. Override negative sampling with `--max-negatives-per-label`.
 
 Labels with fewer than 50 training examples are filtered out by default. Override with `--min-train-positives`.
 

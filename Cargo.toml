@@ -1,19 +1,20 @@
 [package]
-name = "npc-smarts"
+name = "chemtax-smarts"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-description = "End-to-end NPC SMARTS evolution over the published distilled teacher splits."
-repository = "https://github.com/earth-metabolome-initiative/npc-smarts"
+description = "Experiment that evolves SMARTS classifiers for chemical-taxonomy label datasets (NPClassifier, ClassyFire) published on Zenodo."
+repository = "https://github.com/earth-metabolome-initiative/chemtax-smarts"
 readme = "README.md"
-keywords = ["smarts", "chemistry", "npc", "zenodo", "evolution"]
+keywords = ["smarts", "chemistry", "taxonomy", "zenodo", "evolution"]
 categories = ["science", "command-line-utilities"]
 
 [dependencies]
 arrow-array = "58.1.0"
 arrow-schema = "58.1.0"
 clap = { version = "4.6.1", features = ["derive"] }
+indexmap = { version = "2.14.0", features = ["serde"] }
 indicatif = "0.18.4"
 parquet = { version = "58.1.0", default-features = false, features = ["arrow", "zstd"] }
 rayon = "1.12.0"
@@ -25,6 +26,9 @@ smiles-parser = { git = "https://github.com/earth-metabolome-initiative/smiles-p
 thiserror = "2.0.18"
 tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread"] }
 zenodo-rs = { version = "0.1.6", features = ["checksums"] }
+
+[lints.rust]
+missing_docs = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -3 }
