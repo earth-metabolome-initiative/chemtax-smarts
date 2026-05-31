@@ -1,12 +1,14 @@
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use indicatif::{MultiProgress, ProgressBar};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use smarts_evolution::{
     EvolutionConfig as SmartsEvolutionConfig, EvolutionError, EvolutionTask, FoldData,
     IndicatifEvolutionProgress, RankedSmarts, SeedCorpus, SmartsEvaluator, SmartsGenome,
@@ -116,6 +118,10 @@ pub struct ExperimentConfig {
     /// Directory where run artifacts are written.
     #[arg(long, default_value = "artifacts")]
     pub output_dir: PathBuf,
+    /// Ignore any existing `results.jsonl` and restart from scratch. By default a
+    /// run resumes, skipping the labels already recorded in `results.jsonl`.
+    #[arg(long)]
+    pub fresh: bool,
     /// Optional cap on labels evolved per head.
     #[arg(long)]
     pub max_labels_per_head: Option<usize>,
@@ -231,7 +237,7 @@ impl ExperimentConfig {
 }
 
 /// Row counts for one split after sampling.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SplitCounts {
     /// Total sampled rows.
     pub rows: usize,
@@ -242,7 +248,7 @@ pub struct SplitCounts {
 }
 
 /// Scores for one candidate `SMARTS` on both splits.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CandidateScore {
     /// The candidate `SMARTS` pattern.
     pub smarts: String,
@@ -259,7 +265,7 @@ pub struct CandidateScore {
 }
 
 /// Outcome of a label whose evolution finished.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletedTaskReport {
     /// Head name the label belongs to, such as `class` or `pathway`.
     pub head: String,
@@ -296,7 +302,7 @@ pub struct CompletedTaskReport {
 }
 
 /// Outcome of a label that was skipped before or during evolution.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkippedTaskReport {
     /// Head name the label belongs to, such as `class` or `pathway`.
     pub head: String,
@@ -322,7 +328,7 @@ pub enum TaskLogEntry {
 }
 
 /// Result of running a single label task.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskOutcome {
     /// A finished label.
     Completed(CompletedTaskReport),
@@ -552,8 +558,9 @@ pub async fn run_experiment(
     let inputs = load_inputs(config).await?;
     persist_run_metadata(config, &inputs.downloaded_files)?;
 
-    let results_path = initialize_results_path(&config.output_dir)?;
-    let outcomes = run_all_tasks(config, &inputs, &results_path)?;
+    let results_path = config.output_dir.join("results.jsonl");
+    let resumed = initialize_results(&results_path, config.fresh)?;
+    let outcomes = run_all_tasks(config, &inputs, &results_path, resumed)?;
     let (completed_tasks, skipped_tasks) = count_outcomes(&outcomes);
 
     let spec = config.dataset.spec();
@@ -612,49 +619,111 @@ fn persist_run_metadata(
     Ok(())
 }
 
-fn initialize_results_path(output_dir: &Path) -> Result<PathBuf, ExperimentError> {
-    let results_path = output_dir.join("results.jsonl");
-    File::create(&results_path)?;
-    Ok(results_path)
+/// The label identity used to decide what a resumed run can skip.
+fn outcome_key(outcome: &TaskOutcome) -> (String, u16) {
+    match outcome {
+        TaskOutcome::Completed(report) => (report.head.clone(), report.label_id),
+        TaskOutcome::Skipped(report) => (report.head.clone(), report.label_id),
+    }
 }
 
-/// Build the seed corpus: the built-in fragments plus the curated SMARTS embedded
-/// from `seeds/corpus.json`.
+/// Read the outcomes already recorded in a `results.jsonl`. Lines that do not
+/// parse (for example a partial final line from an interrupted run) are dropped,
+/// so their labels are re-run.
+fn load_recorded_outcomes(path: &Path) -> Result<Vec<TaskOutcome>, ExperimentError> {
+    let text = fs::read_to_string(path)?;
+    let mut outcomes = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(outcome) = serde_json::from_str::<TaskOutcome>(line) {
+            outcomes.push(outcome);
+        }
+    }
+    Ok(outcomes)
+}
+
+/// Prepare `results.jsonl` for the run and return the outcomes to resume from.
+///
+/// With `fresh` (or no existing log) the file is truncated and an empty list is
+/// returned. Otherwise the existing log is read, rewritten cleanly (dropping any
+/// partial trailing line), and its outcomes are returned so `run_all_tasks` can
+/// skip those labels.
+fn initialize_results(
+    results_path: &Path,
+    fresh: bool,
+) -> Result<Vec<TaskOutcome>, ExperimentError> {
+    let resumed = if fresh || !results_path.exists() {
+        Vec::new()
+    } else {
+        load_recorded_outcomes(results_path)?
+    };
+    File::create(results_path)?;
+    for outcome in &resumed {
+        append_task_log_entry(results_path, outcome)?;
+    }
+    Ok(resumed)
+}
+
+/// The seed corpus, parsed once per process: the built-in fragments plus the
+/// curated SMARTS embedded from `seeds/corpus.json`. Parsing all ~9k seeds is not
+/// free, so it is cached rather than rebuilt for every run.
+static SEED_CORPUS: LazyLock<Result<SeedCorpus, String>> = LazyLock::new(|| {
+    const CORPUS_JSON: &str = include_str!("../seeds/corpus.json");
+    let seeds: Vec<String> = serde_json::from_str(CORPUS_JSON).map_err(|error| error.to_string())?;
+    let mut corpus = SeedCorpus::builtin();
+    corpus.extend_from_smarts(seeds.iter().map(String::as_str))?;
+    Ok(corpus)
+});
+
+/// Borrow the cached seed corpus.
 ///
 /// # Errors
 ///
 /// Returns an error if the embedded corpus JSON cannot be parsed or if any seed
 /// SMARTS is invalid for `SmartsGenome`.
-fn build_seed_corpus() -> Result<SeedCorpus, ExperimentError> {
-    const CORPUS_JSON: &str = include_str!("../seeds/corpus.json");
-
-    let seeds: Vec<String> = serde_json::from_str(CORPUS_JSON)?;
-    let mut corpus = SeedCorpus::builtin();
-    corpus
-        .extend_from_smarts(seeds.iter().map(String::as_str))
-        .map_err(ExperimentError::InvalidDataset)?;
-    Ok(corpus)
+fn build_seed_corpus() -> Result<&'static SeedCorpus, ExperimentError> {
+    match &*SEED_CORPUS {
+        Ok(corpus) => Ok(corpus),
+        Err(error) => Err(ExperimentError::InvalidDataset(error.clone())),
+    }
 }
 
 fn run_all_tasks(
     config: &ExperimentConfig,
     inputs: &LoadedInputs,
     results_path: &Path,
+    resumed: Vec<TaskOutcome>,
 ) -> Result<Vec<TaskOutcome>, ExperimentError> {
     let evolution_config = config.evolution_config()?;
     let seed_corpus = build_seed_corpus()?;
     let task_plan = sorted_task_plan(config, inputs)?;
-    let progress = ExperimentProgress::new(task_plan.len(), config.dashboard.use_tui());
+
+    let done: HashSet<(String, u16)> = resumed.iter().map(outcome_key).collect();
+    let remaining: Vec<&PlannedLabelTask> = task_plan
+        .iter()
+        .filter(|task| !done.contains(&(task.head_name.clone(), task.label_id)))
+        .collect();
+
+    if !resumed.is_empty() {
+        eprintln!(
+            "resuming | {} labels already in results.jsonl, {} remaining",
+            resumed.len(),
+            remaining.len()
+        );
+    }
+    let progress = ExperimentProgress::new(remaining.len(), config.dashboard.use_tui());
     let task_context = TaskRunContext {
         config,
         evolution_config: &evolution_config,
-        seed_corpus: &seed_corpus,
+        seed_corpus,
         progress: &progress,
         inputs,
     };
-    let mut outcomes = Vec::new();
+    let mut outcomes = resumed;
 
-    for task in &task_plan {
+    for task in remaining {
         let outcome = run_label_task(&task_context, task)?;
         append_task_log_entry(results_path, &outcome)?;
         outcomes.push(outcome);
@@ -1184,6 +1253,7 @@ mod tests {
             dataset: DatasetName::Npclassifier,
             data_dir: PathBuf::from("data"),
             output_dir: PathBuf::from("artifacts"),
+            fresh: false,
             max_labels_per_head: None,
             min_train_positives: 50,
             min_test_positives: 1,
@@ -1685,6 +1755,13 @@ mod tests {
         }
     }
 
+    fn outcome_label_name(outcome: &TaskOutcome) -> &str {
+        match outcome {
+            TaskOutcome::Completed(report) => report.label_name.as_str(),
+            TaskOutcome::Skipped(report) => report.label_name.as_str(),
+        }
+    }
+
     /// Run the real `run_experiment` against a prepared data dir and assert the
     /// dataset-agnostic invariants: artifacts written, every download skipped,
     /// outcomes and the results log line up, and at least one task completes.
@@ -1838,6 +1915,118 @@ mod tests {
         assert!(distinct.len() >= 2);
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn resume_skips_labels_already_in_results_log() {
+        let data_dir = temp_dir("resume-data");
+        let output_dir = temp_dir("resume-out");
+        let vocabulary = "{\"pathway\":[\"p0\"],\"superclass\":[\"s0\"],\"class\":[\"c0\",\"c1\"]}";
+        let train: &[TestSplitRow] = &[
+            ("CCN", 1, vec![vec![0], vec![0], vec![0]]),
+            ("CCO", 2, vec![vec![0], vec![0], vec![0]]),
+            ("CCC", 3, vec![vec![], vec![], vec![0]]),
+            ("CCCC", 4, vec![vec![], vec![], vec![0]]),
+            ("c1ccccc1", 5, vec![vec![], vec![], vec![1]]),
+            ("O", 6, vec![vec![], vec![], vec![]]),
+            ("N", 7, vec![vec![], vec![], vec![]]),
+            ("CO", 8, vec![vec![], vec![], vec![]]),
+        ];
+        let validation: &[TestSplitRow] = &[
+            ("CN", 9, vec![vec![0], vec![0], vec![0]]),
+            ("CC", 10, vec![vec![], vec![], vec![]]),
+        ];
+        let test: &[TestSplitRow] = &[
+            ("CCN", 11, vec![vec![0], vec![0], vec![0]]),
+            ("CCO", 12, vec![vec![], vec![], vec![]]),
+        ];
+        populate_dataset_dir(
+            &data_dir,
+            &NPCLASSIFIER_DATASET,
+            &NPC_HEADS,
+            vocabulary,
+            train,
+            validation,
+            test,
+        );
+
+        let mut config = baseline_config();
+        config.dataset = DatasetName::Npclassifier;
+        config.data_dir = data_dir.clone();
+        config.output_dir = output_dir.clone();
+        config.max_labels_per_head = Some(3);
+        config.min_train_positives = 1;
+        config.min_test_positives = 1;
+        config.max_negatives_per_label = 256;
+        config.population_size = 12;
+        config.generation_limit = 2;
+        config.stagnation_limit = 2;
+        config.leaderboard_size = 4;
+        config.rng_seed = Some(7);
+
+        let results_path = output_dir.join("results.jsonl");
+
+        // First run records every planned label.
+        let first = ok(run_experiment(&config).await);
+        let total = first.outcomes.len();
+        assert!(total >= 2);
+
+        // Rewrite the log keeping all but the last label, and rename the kept ones
+        // to a sentinel. A resumed (loaded) outcome keeps the sentinel name, while a
+        // re-evolved one would carry the real vocabulary name, so this distinguishes
+        // a real skip from an accidental re-run.
+        let recorded = ok(std::fs::read_to_string(&results_path));
+        let mut lines: Vec<&str> = recorded.lines().filter(|line| !line.trim().is_empty()).collect();
+        lines.pop();
+        let mut tampered = String::new();
+        for line in &lines {
+            let mut value: serde_json::Value = ok(serde_json::from_str(line));
+            if let Some(object) = value.as_object_mut() {
+                for inner in object.values_mut() {
+                    if let Some(report) = inner.as_object_mut() {
+                        report.insert(
+                            "label_name".to_owned(),
+                            serde_json::Value::String("RESUMED_MARKER".to_owned()),
+                        );
+                    }
+                }
+            }
+            tampered.push_str(&ok(serde_json::to_string(&value)));
+            tampered.push('\n');
+        }
+        assert!(std::fs::write(&results_path, &tampered).is_ok());
+
+        // Resume: the recorded labels are skipped (sentinel survives), the one
+        // dropped label is re-run (real name), and the total is unchanged.
+        let second = ok(run_experiment(&config).await);
+        assert_eq!(second.outcomes.len(), total);
+        let resumed = second
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome_label_name(outcome) == "RESUMED_MARKER")
+            .count();
+        let rerun = second
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome_label_name(outcome) != "RESUMED_MARKER")
+            .count();
+        assert_eq!(resumed, total - 1);
+        assert_eq!(rerun, 1);
+
+        // A fresh run ignores the log and re-evolves everything, so no sentinel
+        // survives.
+        config.fresh = true;
+        let third = ok(run_experiment(&config).await);
+        assert_eq!(third.outcomes.len(), total);
+        assert!(
+            third
+                .outcomes
+                .iter()
+                .all(|outcome| outcome_label_name(outcome) != "RESUMED_MARKER")
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&output_dir);
     }
 
     #[tokio::test]
