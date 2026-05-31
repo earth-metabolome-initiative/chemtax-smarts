@@ -50,6 +50,9 @@ pub enum ExperimentError {
     /// The dataset is structurally invalid or inconsistent.
     #[error("invalid dataset: {0}")]
     InvalidDataset(String),
+    /// The shard selection (`--shard-index` / `--shard-count`) is inconsistent.
+    #[error("invalid shard configuration: {0}")]
+    InvalidShard(String),
     /// A parquet split is missing an expected column.
     #[error("missing parquet column {column} in split {split}")]
     MissingParquetColumn {
@@ -89,6 +92,9 @@ fn use_tui() -> bool {
 }
 
 /// Command line configuration for one experiment run.
+// The bool fields are independent CLI flags, not a state machine, so the
+// excessive-bools lint does not apply.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Parser, Serialize)]
 pub struct ExperimentConfig {
     /// Which published dataset to evolve against. Required.
@@ -100,6 +106,21 @@ pub struct ExperimentConfig {
     /// Directory where run artifacts are written.
     #[arg(long, default_value = "artifacts")]
     pub output_dir: PathBuf,
+    /// Zero-based index of this shard when the label task plan is distributed
+    /// across machines. Must be less than `--shard-count`. The sorted plan is
+    /// striped by `task_index % shard_count == shard_index`, so each shard gets a
+    /// disjoint, size-balanced slice. Give every shard its own `--output-dir`.
+    #[arg(long, default_value_t = 0)]
+    pub shard_index: usize,
+    /// Number of shards the label task plan is split into. Defaults to 1, meaning
+    /// no sharding (one process evolves every label).
+    #[arg(long, default_value_t = 1)]
+    pub shard_count: usize,
+    /// Download the dataset files into `--data-dir` and exit without loading the
+    /// splits or evolving any labels. Use once to warm a shared data directory
+    /// before launching the shard array, so the workers all skip the download.
+    #[arg(long)]
+    pub download_only: bool,
     /// Ignore any existing `results.jsonl` and restart from scratch. By default a
     /// run resumes, skipping the labels already recorded in `results.jsonl`.
     #[arg(long)]
@@ -179,6 +200,22 @@ impl ExperimentConfig {
             DatasetName::Npclassifier => 4_096,
             DatasetName::Classyfire => 256,
         })
+    }
+
+    /// Reject a shard selection that names a non-existent shard.
+    fn validate_sharding(&self) -> Result<(), ExperimentError> {
+        if self.shard_count == 0 {
+            return Err(ExperimentError::InvalidShard(
+                "--shard-count must be at least 1".to_owned(),
+            ));
+        }
+        if self.shard_index >= self.shard_count {
+            return Err(ExperimentError::InvalidShard(format!(
+                "--shard-index {} is out of range for --shard-count {}",
+                self.shard_index, self.shard_count
+            )));
+        }
+        Ok(())
     }
 
     /// Convert the CLI-facing knobs into one validated evolution config.
@@ -543,7 +580,14 @@ impl PlannedLabelTask {
 pub async fn run_experiment(
     config: &ExperimentConfig,
 ) -> Result<ExperimentSummary, ExperimentError> {
+    config.validate_sharding()?;
     fs::create_dir_all(&config.output_dir)?;
+
+    if config.download_only {
+        let downloaded_files = ensure_dataset(&config.data_dir, config.dataset.spec()).await?;
+        return Ok(download_only_summary(config, downloaded_files));
+    }
+
     let inputs = load_inputs(config).await?;
     persist_run_metadata(config, &inputs.downloaded_files)?;
 
@@ -566,6 +610,26 @@ pub async fn run_experiment(
     };
     write_json_pretty(&config.output_dir.join("summary.json"), &summary)?;
     Ok(summary)
+}
+
+/// Build the summary returned by a `--download-only` run: the dataset is fetched
+/// but no splits are loaded and no labels are planned.
+fn download_only_summary(
+    config: &ExperimentConfig,
+    downloaded_files: Vec<DownloadedDatasetFile>,
+) -> ExperimentSummary {
+    let spec = config.dataset.spec();
+    ExperimentSummary {
+        dataset_record_id: spec.record_id,
+        dataset_doi: spec.doi.to_owned(),
+        config: config.clone(),
+        downloaded_files,
+        completed_tasks: 0,
+        skipped_tasks: 0,
+        output_dir: config.output_dir.clone(),
+        results_path: config.output_dir.join("results.jsonl"),
+        outcomes: Vec::new(),
+    }
 }
 
 async fn load_inputs(config: &ExperimentConfig) -> Result<LoadedInputs, ExperimentError> {
@@ -711,10 +775,21 @@ fn run_all_tasks(
     let evolution_config = config.evolution_config()?;
     let seed_corpus = build_seed_corpus()?;
     let task_plan = sorted_task_plan(config, inputs)?;
+    let shard_plan = shard_tasks(&task_plan, config.shard_index, config.shard_count);
+
+    if config.shard_count > 1 {
+        eprintln!(
+            "shard {}/{} | {} of {} planned labels assigned to this shard",
+            config.shard_index,
+            config.shard_count,
+            shard_plan.len(),
+            task_plan.len()
+        );
+    }
 
     let done: HashSet<(String, u16)> = resumed.iter().map(outcome_key).collect();
-    let remaining: Vec<&PlannedLabelTask> = task_plan
-        .iter()
+    let remaining: Vec<&PlannedLabelTask> = shard_plan
+        .into_iter()
         .filter(|task| !done.contains(&(task.head_name.clone(), task.label_id)))
         .collect();
 
@@ -893,6 +968,24 @@ fn sorted_task_plan(
 
 fn sort_task_plan(tasks: &mut [PlannedLabelTask]) {
     tasks.sort_by(compare_planned_tasks);
+}
+
+/// Select the tasks belonging to one shard. The sorted plan is striped by
+/// position, so consecutive (similarly sized) tasks land in different shards and
+/// each shard sees a balanced mix of cheap and expensive labels. The selection is
+/// a pure function of the plan and the shard parameters, so it is stable across
+/// resumes and identical on every machine.
+fn shard_tasks(
+    tasks: &[PlannedLabelTask],
+    shard_index: usize,
+    shard_count: usize,
+) -> Vec<&PlannedLabelTask> {
+    tasks
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| position % shard_count == shard_index)
+        .map(|(_, task)| task)
+        .collect()
 }
 
 fn compare_planned_tasks(left: &PlannedLabelTask, right: &PlannedLabelTask) -> Ordering {
@@ -1264,6 +1357,9 @@ mod tests {
             dataset: DatasetName::Npclassifier,
             data_dir: PathBuf::from("data"),
             output_dir: PathBuf::from("artifacts"),
+            shard_index: 0,
+            shard_count: 1,
+            download_only: false,
             fresh: false,
             max_labels_per_head: None,
             min_train_positives: 10,
@@ -2089,6 +2185,174 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[test]
+    fn shard_tasks_partition_the_plan_without_overlap() {
+        let plan: Vec<PlannedLabelTask> = (0..10)
+            .map(|index| {
+                planned_task(
+                    index,
+                    u16::try_from(index).unwrap_or(0),
+                    "label",
+                    index + 1,
+                    0,
+                )
+            })
+            .collect();
+
+        let shard_count = 3;
+        let mut seen: Vec<u16> = Vec::new();
+        for shard_index in 0..shard_count {
+            let shard = shard_tasks(&plan, shard_index, shard_count);
+            for task in &shard {
+                seen.push(task.label_id);
+            }
+        }
+        seen.sort_unstable();
+
+        let expected: Vec<u16> = (0u16..10).collect();
+        assert_eq!(seen, expected, "shards must cover every task exactly once");
+
+        // A single shard sees the whole plan; counts stay balanced (4/3/3 here).
+        assert_eq!(shard_tasks(&plan, 0, 1).len(), 10);
+        assert_eq!(shard_tasks(&plan, 0, shard_count).len(), 4);
+        assert_eq!(shard_tasks(&plan, 1, shard_count).len(), 3);
+        assert_eq!(shard_tasks(&plan, 2, shard_count).len(), 3);
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_or_empty_shard() {
+        let mut config = baseline_config();
+
+        config.shard_count = 4;
+        config.shard_index = 4;
+        assert!(matches!(
+            config.validate_sharding(),
+            Err(ExperimentError::InvalidShard(_))
+        ));
+
+        config.shard_count = 0;
+        config.shard_index = 0;
+        assert!(matches!(
+            config.validate_sharding(),
+            Err(ExperimentError::InvalidShard(_))
+        ));
+
+        config.shard_count = 4;
+        config.shard_index = 3;
+        assert!(config.validate_sharding().is_ok());
+    }
+
+    #[tokio::test]
+    async fn download_only_skips_planning_and_writes_no_results() {
+        // All spec files are present, so `ensure_dataset` is a pure skip with no
+        // network access. `--download-only` must return before loading splits.
+        let data_dir = temp_dir("download-only-data");
+        let output_dir = temp_dir("download-only-out");
+        let vocabulary = "{\"pathway\":[\"p0\"],\"superclass\":[\"s0\"],\"class\":[\"c0\"]}";
+        let rows: &[TestSplitRow] = &[("CCN", 1, vec![vec![0], vec![0], vec![0]])];
+        populate_dataset_dir(
+            &data_dir,
+            &NPCLASSIFIER_DATASET,
+            &NPC_HEADS,
+            vocabulary,
+            rows,
+            rows,
+            rows,
+        );
+
+        let mut config = baseline_config();
+        config.data_dir = data_dir.clone();
+        config.output_dir = output_dir.clone();
+        config.download_only = true;
+
+        let summary = ok(run_experiment(&config).await);
+        assert_eq!(summary.completed_tasks, 0);
+        assert!(summary.outcomes.is_empty());
+        assert!(summary.downloaded_files.iter().all(|file| file.skipped));
+        assert!(!output_dir.join("results.jsonl").exists());
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&output_dir);
+    }
+
+    #[tokio::test]
+    async fn sharded_runs_cover_the_same_labels_as_an_unsharded_run() {
+        let data_dir = temp_dir("shard-data");
+        let vocabulary = "{\"pathway\":[\"p0\"],\"superclass\":[\"s0\"],\"class\":[\"c0\",\"c1\"]}";
+        let train: &[TestSplitRow] = &[
+            ("CCN", 1, vec![vec![0], vec![0], vec![0]]),
+            ("CCO", 2, vec![vec![0], vec![0], vec![0]]),
+            ("CCC", 3, vec![vec![], vec![], vec![0]]),
+            ("CCCC", 4, vec![vec![], vec![], vec![0]]),
+            ("c1ccccc1", 5, vec![vec![], vec![], vec![1]]),
+            ("O", 6, vec![vec![], vec![], vec![]]),
+            ("N", 7, vec![vec![], vec![], vec![]]),
+            ("CO", 8, vec![vec![], vec![], vec![]]),
+        ];
+        let validation: &[TestSplitRow] = &[
+            ("CN", 9, vec![vec![0], vec![0], vec![0]]),
+            ("CC", 10, vec![vec![], vec![], vec![]]),
+        ];
+        let test: &[TestSplitRow] = &[
+            ("CCN", 11, vec![vec![0], vec![0], vec![0]]),
+            ("CCO", 12, vec![vec![], vec![], vec![]]),
+        ];
+        populate_dataset_dir(
+            &data_dir,
+            &NPCLASSIFIER_DATASET,
+            &NPC_HEADS,
+            vocabulary,
+            train,
+            validation,
+            test,
+        );
+
+        let run = |tag: &'static str, shard_index: usize, shard_count: usize| {
+            let data_dir = data_dir.clone();
+            async move {
+                let output_dir = temp_dir(tag);
+                let mut config = baseline_config();
+                config.data_dir = data_dir;
+                config.output_dir = output_dir.clone();
+                config.shard_index = shard_index;
+                config.shard_count = shard_count;
+                config.max_labels_per_head = Some(3);
+                config.min_train_positives = 1;
+                config.min_test_positives = 1;
+                config.max_negatives_per_label = Some(256);
+                config.population_size = 12;
+                config.generation_limit = 2;
+                config.stagnation_limit = 2;
+                config.leaderboard_size = 4;
+                config.rng_seed = Some(7);
+                let summary = ok(run_experiment(&config).await);
+                let _ = std::fs::remove_dir_all(&output_dir);
+                summary
+            }
+        };
+
+        let full = run("shard-full", 0, 1).await;
+        let shard0 = run("shard-0", 0, 2).await;
+        let shard1 = run("shard-1", 1, 2).await;
+
+        let keys = |summary: &ExperimentSummary| -> Vec<(String, u16)> {
+            summary.outcomes.iter().map(outcome_key).collect()
+        };
+        let full_keys: HashSet<(String, u16)> = keys(&full).into_iter().collect();
+        let shard0_keys: HashSet<(String, u16)> = keys(&shard0).into_iter().collect();
+        let shard1_keys: HashSet<(String, u16)> = keys(&shard1).into_iter().collect();
+
+        assert!(full.outcomes.len() >= 2, "need at least two tasks to split");
+        assert!(
+            shard0_keys.is_disjoint(&shard1_keys),
+            "shards must not share a label"
+        );
+        let union: HashSet<(String, u16)> = shard0_keys.union(&shard1_keys).cloned().collect();
+        assert_eq!(union, full_keys, "shards together cover the whole plan");
+
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 
     #[tokio::test]

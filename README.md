@@ -26,6 +26,27 @@ Give each dataset its own `--data-dir` and `--output-dir`. Both datasets use the
 
 The dataset is downloaded from Zenodo into `--data-dir` on first run and reused afterwards (default `data/`, but give each dataset a distinct path as above). Runs resume from `<output-dir>/results.jsonl` by default. Pass `--fresh` to start over.
 
+### Distributing over a cluster
+
+The per-label work is independent, so a run splits cleanly across machines. Pass `--shard-count N` and `--shard-index I` to evolve only the labels where `task_index % N == I`, giving each shard its own `--output-dir`.
+
+`slurm/lrc/` wraps this into a Lawrencium job array. Set your allocation (the scripts ship with an `xxxxxxxxxxxxxxxx` placeholder), build the binary on a compute node, then prefetch, submit, and merge:
+
+```bash
+export CHEMTAX_LRC_ACCOUNT=pc_yourpi
+
+salloc --partition=lr6 --qos=lr_normal --nodes=1 --time=1:00:00
+bash slurm/lrc/setup_env.sh     # build target/release/chemtax-smarts
+exit
+
+bash slurm/lrc/prefetch.sh classyfire   # warm the shared data dir once
+bash slurm/lrc/submit.sh classyfire     # 512 shards by default (npclassifier: 64)
+bash slurm/lrc/status.sh classyfire 60  # watch the queue, refresh every 60s
+bash slurm/lrc/merge.sh classyfire      # concatenate per-shard results when done
+```
+
+Add `--dry-run` to `submit.sh` to print the `sbatch` commands without queueing, or `--debug` for a single shard on the debug partition. See `slurm/lrc/README.md` for the full option list and the scratch layout.
+
 On an interactive terminal, each label evolves in the native `smarts-evolution` dashboard (live MCC and coverage plots, the current best SMARTS, and pause/stop/help). When stdout is piped or redirected, it falls back to progress bars.
 
 Each task includes all positives and caps sampled negatives per bucket, where a bucket is one of the trained head's other labels. The total negatives scale with the head's label count, so the cap defaults per dataset: 4096 for `npclassifier`, 256 for `classyfire` (whose heads have thousands of labels). Override with `--max-negatives-per-label`.
