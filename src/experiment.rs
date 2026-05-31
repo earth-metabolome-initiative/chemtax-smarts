@@ -108,7 +108,7 @@ pub struct ExperimentConfig {
     #[arg(long)]
     pub max_labels_per_head: Option<usize>,
     /// Minimum training positives a label needs to be evolved.
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = 10)]
     pub min_train_positives: usize,
     /// Minimum test positives a label needs to be evolved.
     #[arg(long, default_value_t = 1)]
@@ -1233,7 +1233,7 @@ mod tests {
             output_dir: PathBuf::from("artifacts"),
             fresh: false,
             max_labels_per_head: None,
-            min_train_positives: 50,
+            min_train_positives: 10,
             min_test_positives: 1,
             max_negatives_per_label: 4_096,
             leaderboard_size: 32,

@@ -30,7 +30,7 @@ When stdout is an interactive terminal, each label's evolution runs in the nativ
 
 By default, each training/test task set includes all positives and samples up to 4096 negatives per label of the head being trained. Override negative sampling with `--max-negatives-per-label`.
 
-Labels with fewer than 50 training examples are filtered out by default. Override with `--min-train-positives`.
+Labels with fewer than 10 training examples are filtered out by default. Override with `--min-train-positives`.
 
 The default GA evaluates 512 SMARTS per generation for up to 300 generations, with early stopping after 30 stagnant generations.
 
