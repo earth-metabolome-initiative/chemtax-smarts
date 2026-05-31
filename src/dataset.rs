@@ -49,11 +49,9 @@ impl LabelHead {
     }
 }
 
-/// Ordered label vocabulary loaded from the dataset's `vocabulary.json`. The JSON
-/// is an object mapping each head name to its ordered list of label names. The
-/// key order defines the canonical head order, and [`LabelHead`] handles index
-/// into it. This shape supports any head set the dataset declares, so the same
-/// code reads the 3-head `NPClassifier` vocabulary and the 9-head `ClassyFire` one.
+/// Ordered label vocabulary loaded from the dataset's `vocabulary.json`: an object
+/// mapping each head name to its ordered list of label names. The key order is the
+/// canonical head order that [`LabelHead`] indexes into.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Vocabulary {

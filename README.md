@@ -22,15 +22,29 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release -- \
   --dataset classyfire --output-dir artifacts-classyfire
 ```
 
-Give each dataset its own `--output-dir`. Both declare `class` and `superclass` heads, and a run resumes by skipping the `(head, label)` pairs already in `<output-dir>/results.jsonl`, so a shared directory would make one dataset skip the other's labels.
+Give each dataset its own `--output-dir`: both declare `class` and `superclass` heads, so sharing a directory would make a resumed run skip the other dataset's labels.
 
-The dataset is downloaded from Zenodo into `--data-dir` (default `data/`) on first run and reused afterwards. A run resumes by default. Pass `--fresh` to ignore an existing `results.jsonl` and start over.
+The dataset is downloaded from Zenodo into `--data-dir` (default `data/`) on first run and reused afterwards. Runs resume from `<output-dir>/results.jsonl` by default. Pass `--fresh` to start over.
 
-When stdout is an interactive terminal, each label's evolution runs in the native full-screen dashboard from `smarts-evolution`, with live MCC and coverage plots, the current best SMARTS, and pause, stop, and help controls. Stopping a label from the dashboard skips that label and moves on to the next one. When the output is redirected or piped (for example in CI), the run falls back to the indicatif progress bars instead.
+On an interactive terminal, each label evolves in the native `smarts-evolution` dashboard (live MCC and coverage plots, the current best SMARTS, and pause/stop/help). When stdout is piped or redirected, it falls back to progress bars.
 
 By default, each training/test task set includes all positives and samples up to 4096 negatives per label of the head being trained. Override negative sampling with `--max-negatives-per-label`.
 
-Labels with fewer than 10 training examples are filtered out by default. Override with `--min-train-positives`.
+Labels with fewer than 10 training examples are filtered out by default. Override with `--min-train-positives`. At this cutoff, 752 of 770 `NPClassifier` labels and 9,835 of 10,947 `ClassyFire` labels clear the bar and are evolved. Per head (passing / total):
+
+| head | `NPClassifier` | `ClassyFire` |
+| --- | --- | --- |
+| `pathway` | 7 / 7 | - |
+| `kingdom` | - | 2 / 2 |
+| `superclass` | 75 / 76 | 29 / 31 |
+| `class` | 670 / 687 | 604 / 641 |
+| `subclass` | - | 1,644 / 1,921 |
+| `direct_parent` | - | 3,220 / 3,617 |
+| `intermediate_nodes` | - | 715 / 765 |
+| `alternative_parents` | - | 2,870 / 3,172 |
+| `substituents` | - | 372 / 396 |
+| `mapped_features` | - | 379 / 402 |
+| total | 752 / 770 | 9,835 / 10,947 |
 
 The default GA evaluates 512 SMARTS per generation for up to 300 generations, with early stopping after 30 stagnant generations.
 
@@ -38,4 +52,4 @@ Results report both MCC and match coverage scores for the merged training pool a
 
 Generated SMARTS are restricted to the conservative PubChem-compatible subset provided by `smarts-evolution`.
 
-Slow SMARTS warnings are logged by default after 30 seconds. Each SMARTS evaluation also has a cooperative 1 second time limit by default, and SMARTS length can be capped before evaluation. Use `--slow-evaluation-log-threshold-millis`, `--match-time-limit-millis`, and `--max-evaluation-smarts-len` to tune evaluation guardrails. The run writes these warnings to `artifacts/slow-smarts.log` without colliding with the progress bars.
+Each SMARTS evaluation has a 1 second time limit, and evaluations slower than 30 seconds are logged to `<output-dir>/slow-smarts.log`. Tune these with `--match-time-limit-millis`, `--slow-evaluation-log-threshold-millis`, and `--max-evaluation-smarts-len`.
