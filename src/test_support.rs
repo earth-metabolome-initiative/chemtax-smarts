@@ -91,7 +91,7 @@ pub(crate) fn write_split_parquet(path: &Path, heads: &[&str], rows: &[TestSplit
 }
 
 /// Create an empty placeholder for every `spec.files` entry not already present,
-/// so `ensure_distillation_dataset` sees the dataset as fully downloaded and
+/// so `ensure_dataset` sees the dataset as fully downloaded and
 /// never reaches the network. The loader only reads `vocabulary.json` and the
 /// three split parquets, so empty placeholders for the rest are harmless.
 pub(crate) fn touch_missing_spec_files(dir: &Path, spec: &DatasetSpec) {

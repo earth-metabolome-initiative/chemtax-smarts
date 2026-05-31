@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar};
 use serde::{Deserialize, Serialize};
 use smarts_evolution::{
@@ -82,35 +82,17 @@ pub enum ExperimentError {
     },
 }
 
-/// How the per-label evolution renders its live progress.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DashboardMode {
-    /// Use the native `TUI` dashboard when `stdout` is an interactive terminal,
-    /// otherwise fall back to indicatif progress bars.
-    Auto,
-    /// Always use the native `TUI` dashboard.
-    Always,
-    /// Never use the `TUI` dashboard, always use indicatif progress bars.
-    Never,
-}
-
-impl DashboardMode {
-    /// Resolve whether the TUI dashboard should drive the evolution phase.
-    fn use_tui(self) -> bool {
-        match self {
-            Self::Always => true,
-            Self::Never => false,
-            Self::Auto => std::io::stdout().is_terminal(),
-        }
-    }
+/// Whether the native `TUI` dashboard drives the evolution phase: yes when stdout
+/// is an interactive terminal, otherwise the indicatif progress bars are used.
+fn use_tui() -> bool {
+    std::io::stdout().is_terminal()
 }
 
 /// Command line configuration for one experiment run.
 #[derive(Debug, Clone, Parser, Serialize)]
 pub struct ExperimentConfig {
-    /// Which published dataset to evolve against.
-    #[arg(long, value_enum, default_value_t = DatasetName::Npclassifier)]
+    /// Which published dataset to evolve against. Required.
+    #[arg(long, value_enum)]
     pub dataset: DatasetName,
     /// Directory holding the downloaded dataset files.
     #[arg(long, default_value = "data")]
@@ -186,9 +168,6 @@ pub struct ExperimentConfig {
     /// Disable slow-evaluation logging entirely.
     #[arg(long)]
     pub disable_slow_evaluation_logging: bool,
-    /// How live progress is rendered.
-    #[arg(long, value_enum, default_value_t = DashboardMode::Auto)]
-    pub dashboard: DashboardMode,
 }
 
 impl ExperimentConfig {
@@ -713,7 +692,7 @@ fn run_all_tasks(
             remaining.len()
         );
     }
-    let progress = ExperimentProgress::new(remaining.len(), config.dashboard.use_tui());
+    let progress = ExperimentProgress::new(remaining.len(), use_tui());
     let task_context = TaskRunContext {
         config,
         evolution_config: &evolution_config,
@@ -1030,7 +1009,7 @@ fn run_evolution_with_tui(
         Err(TuiEvolutionError::Stopped) => Ok(None),
         Err(TuiEvolutionError::Evolution(error)) => Err(ExperimentError::Evolution(error)),
         Err(TuiEvolutionError::Terminal(error)) => Err(ExperimentError::Dashboard(format!(
-            "could not start or drive the TUI dashboard ({error}). Rerun with --dashboard never to use progress bars"
+            "could not start or drive the TUI dashboard ({error}). Redirect or pipe stdout to fall back to progress bars"
         ))),
         Err(
             error @ (TuiEvolutionError::WorkerDisconnected | TuiEvolutionError::WorkerPanicked),
@@ -1275,7 +1254,6 @@ mod tests {
             disable_match_time_limit: false,
             slow_evaluation_log_threshold_millis: 30_000,
             disable_slow_evaluation_logging: false,
-            dashboard: DashboardMode::Never,
         }
     }
 
