@@ -15,16 +15,16 @@
 ```bash
 # NPClassifier (Zenodo 19701295)
 RUSTFLAGS="-C target-cpu=native" cargo run --release -- \
-  --dataset npclassifier --output-dir artifacts-npclassifier
+  --dataset npclassifier --data-dir data/npclassifier --output-dir artifacts-npclassifier
 
 # ClassyFire / ChemOnt (Zenodo 20472700)
 RUSTFLAGS="-C target-cpu=native" cargo run --release -- \
-  --dataset classyfire --output-dir artifacts-classyfire
+  --dataset classyfire --data-dir data/classyfire --output-dir artifacts-classyfire
 ```
 
-Give each dataset its own `--output-dir`: both declare `class` and `superclass` heads, so sharing a directory would make a resumed run skip the other dataset's labels.
+Give each dataset its own `--data-dir` and `--output-dir`. Both datasets use the same file names, so a shared `--data-dir` would load whichever dataset's files are already there. The run aborts if the directory's `vocabulary.json` heads do not match `--dataset`. Both also declare `class` and `superclass` heads, so a shared `--output-dir` would make a resumed run skip the other dataset's labels.
 
-The dataset is downloaded from Zenodo into `--data-dir` (default `data/`) on first run and reused afterwards. Runs resume from `<output-dir>/results.jsonl` by default. Pass `--fresh` to start over.
+The dataset is downloaded from Zenodo into `--data-dir` on first run and reused afterwards (default `data/`, but give each dataset a distinct path as above). Runs resume from `<output-dir>/results.jsonl` by default. Pass `--fresh` to start over.
 
 On an interactive terminal, each label evolves in the native `smarts-evolution` dashboard (live MCC and coverage plots, the current best SMARTS, and pause/stop/help). When stdout is piped or redirected, it falls back to progress bars.
 

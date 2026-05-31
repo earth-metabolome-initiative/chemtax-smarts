@@ -562,6 +562,7 @@ async fn load_inputs(config: &ExperimentConfig) -> Result<LoadedInputs, Experime
     let downloaded_files = ensure_dataset(&config.data_dir, config.dataset.spec()).await?;
     let loading_progress = InputLoadProgress::new();
     let vocabulary = loading_progress.load_vocabulary(&config.data_dir.join("vocabulary.json"))?;
+    check_dataset_matches(config, &vocabulary)?;
     let head_names = vocabulary.head_names();
     let train = loading_progress.load_split(
         &config.data_dir.join("train.parquet"),
@@ -583,6 +584,28 @@ async fn load_inputs(config: &ExperimentConfig) -> Result<LoadedInputs, Experime
         training,
         test,
     })
+}
+
+/// Guard against a `--data-dir` that holds a different dataset. Both datasets ship
+/// the same file names, so a mismatched directory would silently load the wrong
+/// data. Compare the loaded vocabulary's heads against the dataset's expected set.
+fn check_dataset_matches(
+    config: &ExperimentConfig,
+    vocabulary: &Vocabulary,
+) -> Result<(), ExperimentError> {
+    let mut expected: Vec<&str> = config.dataset.spec().heads.to_vec();
+    expected.sort_unstable();
+    let mut loaded: Vec<String> = vocabulary.head_names();
+    loaded.sort();
+    let loaded_refs: Vec<&str> = loaded.iter().map(String::as_str).collect();
+    if loaded_refs == expected {
+        return Ok(());
+    }
+    Err(ExperimentError::InvalidDataset(format!(
+        "vocabulary in {} declares heads {loaded:?}, but the {:?} dataset expects {expected:?}. Point --data-dir at the right dataset's files.",
+        config.data_dir.display(),
+        config.dataset,
+    )))
 }
 
 fn persist_run_metadata(
@@ -1899,6 +1922,36 @@ mod tests {
         assert!(distinct.len() >= 2);
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn run_aborts_when_data_dir_holds_a_different_dataset() {
+        // An NPClassifier-shaped vocabulary on disk while `--dataset classyfire`
+        // is requested: the head guard must abort before loading any splits.
+        let data_dir = temp_dir("wrong-dataset-data");
+        let output_dir = temp_dir("wrong-dataset-out");
+        let vocabulary = "{\"pathway\":[\"p0\"],\"superclass\":[\"s0\"],\"class\":[\"c0\"]}";
+        let rows: &[TestSplitRow] = &[("CCN", 1, vec![vec![0], vec![0], vec![0]])];
+        populate_dataset_dir(
+            &data_dir,
+            &CLASSYFIRE_DATASET,
+            &NPC_HEADS,
+            vocabulary,
+            rows,
+            rows,
+            rows,
+        );
+
+        let mut config = baseline_config();
+        config.dataset = DatasetName::Classyfire;
+        config.data_dir = data_dir.clone();
+        config.output_dir = output_dir.clone();
+
+        let result = run_experiment(&config).await;
+        assert!(matches!(result, Err(ExperimentError::InvalidDataset(_))));
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&output_dir);
     }
 
     #[tokio::test]

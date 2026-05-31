@@ -19,6 +19,10 @@ pub struct DatasetSpec {
     pub doi: &'static str,
     /// File keys to download from the record.
     pub files: &'static [&'static str],
+    /// Head names the dataset's `vocabulary.json` is expected to declare. The
+    /// loader checks the loaded vocabulary against these to catch a `--data-dir`
+    /// that points at a different dataset (both datasets share file names).
+    pub heads: &'static [&'static str],
 }
 
 /// The 3-head `NPClassifier` distilled teacher splits.
@@ -44,6 +48,7 @@ pub const NPCLASSIFIER_DATASET: DatasetSpec = DatasetSpec {
         "test.superclass-vectors.f16.zst",
         "test.class-vectors.f16.zst",
     ],
+    heads: &["pathway", "superclass", "class"],
 };
 
 /// The 9-head `ClassyFire` (`ChemOnt`) splits, published as the
@@ -57,6 +62,17 @@ pub const CLASSYFIRE_DATASET: DatasetSpec = DatasetSpec {
         "train.parquet",
         "validation.parquet",
         "test.parquet",
+    ],
+    heads: &[
+        "kingdom",
+        "superclass",
+        "class",
+        "subclass",
+        "direct_parent",
+        "intermediate_nodes",
+        "alternative_parents",
+        "substituents",
+        "mapped_features",
     ],
 };
 
