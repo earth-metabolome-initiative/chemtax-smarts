@@ -618,13 +618,31 @@ fn initialize_results_path(output_dir: &Path) -> Result<PathBuf, ExperimentError
     Ok(results_path)
 }
 
+/// Build the seed corpus: the built-in fragments plus the curated SMARTS embedded
+/// from `seeds/corpus.json`.
+///
+/// # Errors
+///
+/// Returns an error if the embedded corpus JSON cannot be parsed or if any seed
+/// SMARTS is invalid for `SmartsGenome`.
+fn build_seed_corpus() -> Result<SeedCorpus, ExperimentError> {
+    const CORPUS_JSON: &str = include_str!("../seeds/corpus.json");
+
+    let seeds: Vec<String> = serde_json::from_str(CORPUS_JSON)?;
+    let mut corpus = SeedCorpus::builtin();
+    corpus
+        .extend_from_smarts(seeds.iter().map(String::as_str))
+        .map_err(ExperimentError::InvalidDataset)?;
+    Ok(corpus)
+}
+
 fn run_all_tasks(
     config: &ExperimentConfig,
     inputs: &LoadedInputs,
     results_path: &Path,
 ) -> Result<Vec<TaskOutcome>, ExperimentError> {
     let evolution_config = config.evolution_config()?;
-    let seed_corpus = SeedCorpus::builtin();
+    let seed_corpus = build_seed_corpus()?;
     let task_plan = sorted_task_plan(config, inputs)?;
     let progress = ExperimentProgress::new(task_plan.len(), config.dashboard.use_tui());
     let task_context = TaskRunContext {
@@ -1647,6 +1665,17 @@ mod tests {
         assert!(matches!(outcome, Ok(TaskOutcome::Skipped(_))));
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn seed_corpus_embeds_curated_smarts() {
+        let builtin = SeedCorpus::builtin().len();
+        let corpus = ok(build_seed_corpus());
+        assert!(
+            corpus.len() > builtin + 9_000,
+            "corpus {} should add the curated seeds to builtin {builtin}",
+            corpus.len()
+        );
     }
 
     fn outcome_head(outcome: &TaskOutcome) -> &str {
