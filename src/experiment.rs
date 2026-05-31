@@ -559,8 +559,7 @@ pub async fn run_experiment(
 }
 
 async fn load_inputs(config: &ExperimentConfig) -> Result<LoadedInputs, ExperimentError> {
-    let downloaded_files =
-        ensure_dataset(&config.data_dir, config.dataset.spec()).await?;
+    let downloaded_files = ensure_dataset(&config.data_dir, config.dataset.spec()).await?;
     let loading_progress = InputLoadProgress::new();
     let vocabulary = loading_progress.load_vocabulary(&config.data_dir.join("vocabulary.json"))?;
     let head_names = vocabulary.head_names();
@@ -650,7 +649,8 @@ fn initialize_results(
 /// free, so it is cached rather than rebuilt for every run.
 static SEED_CORPUS: LazyLock<Result<SeedCorpus, String>> = LazyLock::new(|| {
     const CORPUS_JSON: &str = include_str!("../seeds/corpus.json");
-    let seeds: Vec<String> = serde_json::from_str(CORPUS_JSON).map_err(|error| error.to_string())?;
+    let seeds: Vec<String> =
+        serde_json::from_str(CORPUS_JSON).map_err(|error| error.to_string())?;
     let mut corpus = SeedCorpus::builtin();
     corpus.extend_from_smarts(seeds.iter().map(String::as_str))?;
     Ok(corpus)
@@ -1081,7 +1081,6 @@ fn total_task_count(config: &ExperimentConfig, vocabulary: &Vocabulary) -> usize
         .sum()
 }
 
-
 fn evaluate_candidates(
     task_id: &str,
     leaders: &[RankedSmarts],
@@ -1276,7 +1275,11 @@ mod tests {
         let generic: Vec<test_support::TestSplitRow> = rows
             .iter()
             .map(|(smiles, cid, class_ids)| {
-                (*smiles, *cid, vec![Vec::new(), Vec::new(), class_ids.clone()])
+                (
+                    *smiles,
+                    *cid,
+                    vec![Vec::new(), Vec::new(), class_ids.clone()],
+                )
             })
             .collect();
         test_support::write_split_parquet(path, &NPC_HEADS, &generic);
@@ -1310,7 +1313,11 @@ mod tests {
             "validation",
             &heads,
         ));
-        let test = ok(DatasetSplit::load(&root.join("test.parquet"), "test", &heads));
+        let test = ok(DatasetSplit::load(
+            &root.join("test.parquet"),
+            "test",
+            &heads,
+        ));
 
         LoadedInputs {
             downloaded_files: Vec::new(),
@@ -1365,8 +1372,10 @@ mod tests {
             .inputs
             .training
             .label_positive_counts(class, label_count)[label_index];
-        let test_positives =
-            task_context.inputs.test.label_positive_counts(class, label_count)[label_index];
+        let test_positives = task_context
+            .inputs
+            .test
+            .label_positive_counts(class, label_count)[label_index];
         PlannedLabelTask {
             ordinal: 0,
             head: class,
@@ -1615,8 +1624,7 @@ mod tests {
 
     #[test]
     fn json_helpers_write_expected_payloads() {
-        let temp_dir =
-            temp_dir("json-helpers");
+        let temp_dir = temp_dir("json-helpers");
 
         let jsonl_path = temp_dir.join("results.jsonl");
         ok(File::create(&jsonl_path));
@@ -1654,8 +1662,7 @@ mod tests {
 
     #[test]
     fn run_label_task_completes_on_small_class_problem() {
-        let temp_dir =
-            temp_dir("run-label-task");
+        let temp_dir = temp_dir("run-label-task");
 
         let inputs = load_inputs_for_class_task(&temp_dir);
         let mut config = baseline_config();
@@ -1692,8 +1699,7 @@ mod tests {
 
     #[test]
     fn run_label_task_returns_skipped_when_thresholds_are_not_met() {
-        let temp_dir =
-            temp_dir("run-label-skip");
+        let temp_dir = temp_dir("run-label-skip");
 
         let inputs = load_inputs_for_class_task(&temp_dir);
         let mut config = baseline_config();
@@ -1954,7 +1960,10 @@ mod tests {
         // re-evolved one would carry the real vocabulary name, so this distinguishes
         // a real skip from an accidental re-run.
         let recorded = ok(std::fs::read_to_string(&results_path));
-        let mut lines: Vec<&str> = recorded.lines().filter(|line| !line.trim().is_empty()).collect();
+        let mut lines: Vec<&str> = recorded
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
         lines.pop();
         let mut tampered = String::new();
         for line in &lines {
@@ -2017,7 +2026,13 @@ mod tests {
             20_472_700,
         )
         .await;
-        real_data_case("data", &NPCLASSIFIER_DATASET, DatasetName::Npclassifier, 19_701_295).await;
+        real_data_case(
+            "data",
+            &NPCLASSIFIER_DATASET,
+            DatasetName::Npclassifier,
+            19_701_295,
+        )
+        .await;
     }
 
     /// Slice a subset of one real dataset's local files into a temp dir and run
@@ -2042,7 +2057,11 @@ mod tests {
         }
         let data_dir = temp_dir(&format!("smoke-real-{record_id}"));
         assert!(
-            std::fs::copy(src.join("vocabulary.json"), data_dir.join("vocabulary.json")).is_ok()
+            std::fs::copy(
+                src.join("vocabulary.json"),
+                data_dir.join("vocabulary.json")
+            )
+            .is_ok()
         );
         slice_parquet(
             &src.join("train.parquet"),

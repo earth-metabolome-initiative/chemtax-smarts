@@ -96,10 +96,7 @@ pub struct DownloadedDatasetFile {
 
 /// Return the dataset file keys that are absent from `data_dir`.
 #[must_use]
-pub fn missing_dataset_files(
-    data_dir: &Path,
-    spec: &DatasetSpec,
-) -> Vec<&'static str> {
+pub fn missing_dataset_files(data_dir: &Path, spec: &DatasetSpec) -> Vec<&'static str> {
     spec.files
         .iter()
         .copied()
@@ -146,17 +143,16 @@ pub async fn ensure_dataset(
             fs::remove_file(&part_path)?;
         }
         let resolved = client
-            .download_record_file_by_key_to_path(
-                RecordId(spec.record_id),
-                key,
-                &part_path,
-            )
+            .download_record_file_by_key_to_path(RecordId(spec.record_id), key, &part_path)
             .await?;
         fs::rename(&part_path, &final_path)?;
         downloaded_count += 1;
         downloaded.push(record_file(key, final_path, resolved.bytes_written, false));
         progress_bar.inc(1);
-        progress_bar.println(format!("[download] {key} | {} bytes", resolved.bytes_written));
+        progress_bar.println(format!(
+            "[download] {key} | {} bytes",
+            resolved.bytes_written
+        ));
     }
 
     progress_bar.finish_with_message(format!(

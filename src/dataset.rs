@@ -744,7 +744,11 @@ mod tests {
 
         let pathway = LabelHead::new(0);
         let class = LabelHead::new(2);
-        let loaded = ok(DatasetSplit::load(&split_path, "train", &head_names(&NPC_HEADS)));
+        let loaded = ok(DatasetSplit::load(
+            &split_path,
+            "train",
+            &head_names(&NPC_HEADS),
+        ));
         assert_eq!(loaded.name(), "train");
         assert_eq!(loaded.len(), 3);
         assert!(!loaded.is_empty());
@@ -784,7 +788,11 @@ mod tests {
         );
 
         let class = LabelHead::new(2);
-        let loaded = ok(DatasetSplit::load(&split_path, "train", &head_names(&NPC_HEADS)));
+        let loaded = ok(DatasetSplit::load(
+            &split_path,
+            "train",
+            &head_names(&NPC_HEADS),
+        ));
         let progress_bar = ProgressBar::hidden();
         let counts = loaded.sampled_counts_with_progress(class, "class", 0, 1, 1, &progress_bar);
         assert_eq!(
@@ -827,12 +835,13 @@ mod tests {
 
     #[test]
     fn from_pairs_round_trips_head_order() {
-        let vocabulary = Vocabulary::from_pairs([
-            ("pathway", vec!["p0"]),
-            ("superclass", vec!["s0", "s1"]),
-        ]);
+        let vocabulary =
+            Vocabulary::from_pairs([("pathway", vec!["p0"]), ("superclass", vec!["s0", "s1"])]);
         assert_eq!(vocabulary.head_count(), 2);
-        let heads: Vec<&str> = vocabulary.heads().map(|h| vocabulary.head_name(h)).collect();
+        let heads: Vec<&str> = vocabulary
+            .heads()
+            .map(|h| vocabulary.head_name(h))
+            .collect();
         assert_eq!(heads, vec!["pathway", "superclass"]);
     }
 
@@ -872,16 +881,17 @@ mod tests {
             ],
         );
 
-        let loaded = ok(DatasetSplit::load(&split_path, "train", &head_names(&heads)));
+        let loaded = ok(DatasetSplit::load(
+            &split_path,
+            "train",
+            &head_names(&heads),
+        ));
         assert_eq!(loaded.len(), 4);
         assert_eq!(loaded.rows()[0].head_ids.len(), 9);
         assert_eq!(loaded.rows()[0].labels(LabelHead::new(0)), &[0]);
         assert_eq!(loaded.rows()[0].labels(direct_parent), &[0]);
         assert!(loaded.rows()[0].labels(LabelHead::new(2)).is_empty());
-        assert_eq!(
-            loaded.label_positive_counts(direct_parent, 2),
-            vec![2, 2]
-        );
+        assert_eq!(loaded.label_positive_counts(direct_parent, 2), vec![2, 2]);
 
         let fold = ok(loaded.build_fold(direct_parent, "direct_parent", 0));
         assert_eq!(fold.positive_count, 2);
