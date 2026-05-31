@@ -47,6 +47,8 @@ bash slurm/lrc/merge.sh classyfire      # concatenate per-shard results when don
 
 Add `--dry-run` to `submit.sh` to print the `sbatch` commands without queueing, or `--debug` for a single shard on the debug partition. See `slurm/lrc/README.md` for the full option list and the scratch layout.
 
+To reuse work from an earlier run (for example labels already evolved on a local workstation), pass `--resume-from <results.jsonl>`. Every shard treats that log's labels as done and skips them, without copying its entries into the shard output, so the prior compute is not repeated. The seed log must come from the same dataset vocabulary. `--resume-from` is repeatable on the binary, and `submit.sh --resume-from=PATH` applies one to every shard.
+
 On an interactive terminal, each label evolves in the native `smarts-evolution` dashboard (live MCC and coverage plots, the current best SMARTS, and pause/stop/help). When stdout is piped or redirected, it falls back to progress bars.
 
 Each task includes all positives and caps sampled negatives per bucket, where a bucket is one of the trained head's other labels. The total negatives scale with the head's label count, so the cap defaults per dataset: 4096 for `npclassifier`, 256 for `classyfire` (whose heads have thousands of labels). Override with `--max-negatives-per-label`.

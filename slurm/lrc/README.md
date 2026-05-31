@@ -48,4 +48,6 @@ logs/worker_<dataset>_<jobid>_<task>.{out,err}
 
 Each shard resumes from its own `results.jsonl`, so a requeued, preempted, or re-submitted shard skips the labels it already finished. Re-running `submit.sh` with the same `--shards` is safe: the shard-to-label assignment is a pure function of the plan and `--shards`, so a shard always owns the same labels.
 
+To reuse work from a prior run, pass `submit.sh --resume-from=<results.jsonl>`. Every shard treats that log's labels as done and skips them without copying the entries into its own output, so a local run's `results.jsonl` carries over to the cluster with no recompute and no duplication. The seed log must use the same dataset vocabulary. The final result is then the seed log plus the merged shard logs, which are disjoint.
+
 Give each dataset its own data and output directories. Both datasets ship identical file names, and the run aborts if a data dir's `vocabulary.json` heads do not match `--dataset`. The defaults above already separate them by dataset.

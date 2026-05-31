@@ -53,6 +53,14 @@ pub enum ExperimentError {
     /// The shard selection (`--shard-index` / `--shard-count`) is inconsistent.
     #[error("invalid shard configuration: {0}")]
     InvalidShard(String),
+    /// A `--resume-from` log could not be read.
+    #[error("could not read resume log {path}: {message}")]
+    ResumeLog {
+        /// Path of the resume log that failed to load.
+        path: String,
+        /// Underlying error message.
+        message: String,
+    },
     /// A parquet split is missing an expected column.
     #[error("missing parquet column {column} in split {split}")]
     MissingParquetColumn {
@@ -125,6 +133,13 @@ pub struct ExperimentConfig {
     /// run resumes, skipping the labels already recorded in `results.jsonl`.
     #[arg(long)]
     pub fresh: bool,
+    /// Additional `results.jsonl` files whose recorded labels are treated as
+    /// already done and skipped, without copying their entries into this run's
+    /// output. Repeatable. Use to reuse work from a prior run (for example a
+    /// local run) when launching cluster shards. The logs must come from the same
+    /// dataset vocabulary so label ids line up.
+    #[arg(long)]
+    pub resume_from: Vec<PathBuf>,
     /// Optional cap on labels evolved per head.
     #[arg(long)]
     pub max_labels_per_head: Option<usize>,
@@ -719,6 +734,24 @@ fn load_recorded_outcomes(path: &Path) -> Result<Vec<TaskOutcome>, ExperimentErr
     Ok(outcomes)
 }
 
+/// Build the set of label identities to skip from external `--resume-from` logs.
+/// Only the `(head, label_id)` identity is read. The outcomes themselves are not
+/// adopted, so they are never written into this run's own results log.
+fn load_resume_seed_keys(paths: &[PathBuf]) -> Result<HashSet<(String, u16)>, ExperimentError> {
+    let mut keys = HashSet::new();
+    for path in paths {
+        let outcomes =
+            load_recorded_outcomes(path).map_err(|error| ExperimentError::ResumeLog {
+                path: path.display().to_string(),
+                message: error.to_string(),
+            })?;
+        for outcome in &outcomes {
+            keys.insert(outcome_key(outcome));
+        }
+    }
+    Ok(keys)
+}
+
 /// Prepare `results.jsonl` for the run and return the outcomes to resume from.
 ///
 /// With `fresh` (or no existing log) the file is truncated and an empty list is
@@ -776,28 +809,36 @@ fn run_all_tasks(
     let seed_corpus = build_seed_corpus()?;
     let task_plan = sorted_task_plan(config, inputs)?;
     let shard_plan = shard_tasks(&task_plan, config.shard_index, config.shard_count);
+    let assigned = shard_plan.len();
 
     if config.shard_count > 1 {
         eprintln!(
             "shard {}/{} | {} of {} planned labels assigned to this shard",
             config.shard_index,
             config.shard_count,
-            shard_plan.len(),
+            assigned,
             task_plan.len()
         );
     }
 
-    let done: HashSet<(String, u16)> = resumed.iter().map(outcome_key).collect();
+    let mut done: HashSet<(String, u16)> = resumed.iter().map(outcome_key).collect();
+    let seeded = load_resume_seed_keys(&config.resume_from)?;
+    let seeded_count = seeded.len();
+    done.extend(seeded);
+
     let remaining: Vec<&PlannedLabelTask> = shard_plan
         .into_iter()
         .filter(|task| !done.contains(&(task.head_name.clone(), task.label_id)))
         .collect();
 
-    if !resumed.is_empty() {
+    if !resumed.is_empty() || seeded_count > 0 {
         eprintln!(
-            "resuming | {} labels already in results.jsonl, {} remaining",
+            "resuming | {} in own log, {} seeded from {} external log(s), {} of {} assigned labels remaining",
             resumed.len(),
-            remaining.len()
+            seeded_count,
+            config.resume_from.len(),
+            remaining.len(),
+            assigned
         );
     }
     let progress = ExperimentProgress::new(remaining.len(), use_tui());
@@ -1361,6 +1402,7 @@ mod tests {
             shard_count: 1,
             download_only: false,
             fresh: false,
+            resume_from: Vec::new(),
             max_labels_per_head: None,
             min_train_positives: 10,
             min_test_positives: 1,
@@ -2353,6 +2395,91 @@ mod tests {
         assert_eq!(union, full_keys, "shards together cover the whole plan");
 
         let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn resume_from_reports_a_missing_log() {
+        let error = load_resume_seed_keys(&[PathBuf::from("/no/such/resume-log.jsonl")]);
+        assert!(matches!(error, Err(ExperimentError::ResumeLog { .. })));
+    }
+
+    #[tokio::test]
+    async fn resume_from_seeds_skip_without_copying_into_output() {
+        let data_dir = temp_dir("resume-from-data");
+        let vocabulary = "{\"pathway\":[\"p0\"],\"superclass\":[\"s0\"],\"class\":[\"c0\",\"c1\"]}";
+        let train: &[TestSplitRow] = &[
+            ("CCN", 1, vec![vec![0], vec![0], vec![0]]),
+            ("CCO", 2, vec![vec![0], vec![0], vec![0]]),
+            ("CCC", 3, vec![vec![], vec![], vec![0]]),
+            ("CCCC", 4, vec![vec![], vec![], vec![0]]),
+            ("c1ccccc1", 5, vec![vec![], vec![], vec![1]]),
+            ("O", 6, vec![vec![], vec![], vec![]]),
+            ("N", 7, vec![vec![], vec![], vec![]]),
+            ("CO", 8, vec![vec![], vec![], vec![]]),
+        ];
+        let validation: &[TestSplitRow] = &[
+            ("CN", 9, vec![vec![0], vec![0], vec![0]]),
+            ("CC", 10, vec![vec![], vec![], vec![]]),
+        ];
+        let test: &[TestSplitRow] = &[
+            ("CCN", 11, vec![vec![0], vec![0], vec![0]]),
+            ("CCO", 12, vec![vec![], vec![], vec![]]),
+        ];
+        populate_dataset_dir(
+            &data_dir,
+            &NPCLASSIFIER_DATASET,
+            &NPC_HEADS,
+            vocabulary,
+            train,
+            validation,
+            test,
+        );
+
+        let configure = |output_dir: &Path| {
+            let mut config = baseline_config();
+            config.data_dir = data_dir.clone();
+            config.output_dir = output_dir.to_path_buf();
+            config.max_labels_per_head = Some(3);
+            config.min_train_positives = 1;
+            config.min_test_positives = 1;
+            config.max_negatives_per_label = Some(256);
+            config.population_size = 12;
+            config.generation_limit = 2;
+            config.stagnation_limit = 2;
+            config.leaderboard_size = 4;
+            config.rng_seed = Some(7);
+            config
+        };
+
+        // A "local" run records every label into its own log.
+        let local_out = temp_dir("resume-from-local");
+        let local = ok(run_experiment(&configure(&local_out)).await);
+        let local_log = local_out.join("results.jsonl");
+        let local_lines = ok(std::fs::read_to_string(&local_log));
+        let local_count = local_lines.lines().filter(|line| !line.is_empty()).count();
+        assert!(local.outcomes.len() >= 2);
+        assert_eq!(local_count, local.outcomes.len());
+
+        // A second run in a fresh output dir, seeded from the local log, must skip
+        // every label and write nothing of its own (no copies of the seed).
+        let seeded_out = temp_dir("resume-from-seeded");
+        let mut seeded_config = configure(&seeded_out);
+        seeded_config.resume_from = vec![local_log.clone()];
+        let seeded = ok(run_experiment(&seeded_config).await);
+        assert!(
+            seeded.outcomes.is_empty(),
+            "seeded run must skip every already-done label"
+        );
+        let seeded_log = ok(std::fs::read_to_string(seeded_out.join("results.jsonl")));
+        let seeded_count = seeded_log.lines().filter(|line| !line.is_empty()).count();
+        assert_eq!(
+            seeded_count, 0,
+            "seed entries must not be copied into the run's own log"
+        );
+
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&local_out);
+        let _ = std::fs::remove_dir_all(&seeded_out);
     }
 
     #[tokio::test]

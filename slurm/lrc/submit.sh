@@ -32,6 +32,9 @@ Options:
                       (default: $SCRATCH_ROOT/data/<dataset>)
   --output-dir=PATH   Output base directory
                       (default: $SCRATCH_ROOT/results/<dataset>)
+  --resume-from=PATH  A prior results.jsonl whose labels every shard skips
+                      without copying them (for example a local run's log).
+                      Must use the same dataset vocabulary.
   --debug             One lr_debug shard for a quick end-to-end check
   --dry-run           Print sbatch commands without submitting
 USAGE
@@ -55,6 +58,7 @@ N_SHARDS=""
 SHARDS=""
 DATA_DIR=""
 OUTPUT_DIR=""
+RESUME_FROM=""
 DEBUG=false
 DRY_RUN=false
 
@@ -77,6 +81,7 @@ for arg in "$@"; do
         --n-shards=*)     N_SHARDS="${arg#*=}" ;;
         --data-dir=*)     DATA_DIR="${arg#*=}" ;;
         --output-dir=*)   OUTPUT_DIR="${arg#*=}" ;;
+        --resume-from=*)  RESUME_FROM="${arg#*=}" ;;
         --debug)          DEBUG=true ;;
         --dry-run)        DRY_RUN=true ;;
         -h|--help)        usage; exit 0 ;;
@@ -113,6 +118,9 @@ RUN_ARGS=(
     --dataset "$DATASET"
     --data-dir "$DATA_DIR"
 )
+if [ -n "$RESUME_FROM" ]; then
+    RUN_ARGS+=(--resume-from "$RESUME_FROM")
+fi
 
 JOB_NAME="chemtax-$DATASET"
 
@@ -120,6 +128,7 @@ echo "=== Lawrencium shard submission ==="
 echo "Dataset:      $DATASET"
 echo "Data dir:     $DATA_DIR"
 echo "Output dir:   $OUTPUT_DIR"
+[ -n "$RESUME_FROM" ] && echo "Resume from:  $RESUME_FROM"
 echo "Shard range:  $OFFSET..$((OFFSET + N_SHARDS - 1)) / $SHARDS"
 echo "Account:      $ACCOUNT"
 echo "Partition:    $PARTITION"
