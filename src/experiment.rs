@@ -113,10 +113,11 @@ pub struct ExperimentConfig {
     /// Minimum test positives a label needs to be evolved.
     #[arg(long, default_value_t = 1)]
     pub min_test_positives: usize,
-    /// Cap on sampled negatives per stratification bucket, the bucket being the
-    /// trained head's label.
-    #[arg(long, default_value_t = 4_096)]
-    pub max_negatives_per_label: usize,
+    /// Cap on sampled negatives per stratification bucket (the trained head's
+    /// other labels). The total negatives scale with the head's label count, so
+    /// the default is per dataset: 4096 for `npclassifier`, 256 for `classyfire`.
+    #[arg(long)]
+    pub max_negatives_per_label: Option<usize>,
     /// Number of top `SMARTS` kept on each label's leaderboard.
     #[arg(long, default_value_t = 32)]
     pub leaderboard_size: usize,
@@ -171,6 +172,15 @@ pub struct ExperimentConfig {
 }
 
 impl ExperimentConfig {
+    /// Negative-sampling cap to use, falling back to the dataset-specific default
+    /// when `--max-negatives-per-label` is not set.
+    fn negatives_per_label(&self) -> usize {
+        self.max_negatives_per_label.unwrap_or(match self.dataset {
+            DatasetName::Npclassifier => 4_096,
+            DatasetName::Classyfire => 256,
+        })
+    }
+
     /// Convert the CLI-facing knobs into one validated evolution config.
     ///
     /// # Errors
@@ -784,7 +794,7 @@ fn run_label_task(
         &task.head_name,
         task.label_id,
         ALL_POSITIVES_PER_LABEL,
-        config.max_negatives_per_label,
+        config.negatives_per_label(),
         &progress.task_bar,
     )?;
     let Some(result) = evolve_fold_with_progress(
@@ -941,7 +951,7 @@ fn sampled_counts_from_split(
         head_name,
         label_id,
         ALL_POSITIVES_PER_LABEL,
-        task_context.config.max_negatives_per_label,
+        task_context.config.negatives_per_label(),
         &task_context.progress.task_bar,
     );
     counts_from_selection_counts(counts)
@@ -960,7 +970,7 @@ fn build_test_evaluator(
         head_name,
         label_id,
         ALL_POSITIVES_PER_LABEL,
-        config.max_negatives_per_label,
+        config.negatives_per_label(),
         progress,
     )?;
     Ok(SmartsEvaluator::new(vec![test_fold.fold]))
@@ -1258,7 +1268,7 @@ mod tests {
             max_labels_per_head: None,
             min_train_positives: 10,
             min_test_positives: 1,
-            max_negatives_per_label: 4_096,
+            max_negatives_per_label: None,
             leaderboard_size: 32,
             population_size: 512,
             generation_limit: 300,
@@ -1408,6 +1418,18 @@ mod tests {
             training_positives,
             total_positives: training_positives + test_positives,
         }
+    }
+
+    #[test]
+    fn negatives_per_label_defaults_per_dataset() {
+        let mut config = baseline_config();
+        config.max_negatives_per_label = None;
+        config.dataset = DatasetName::Npclassifier;
+        assert_eq!(config.negatives_per_label(), 4_096);
+        config.dataset = DatasetName::Classyfire;
+        assert_eq!(config.negatives_per_label(), 256);
+        config.max_negatives_per_label = Some(99);
+        assert_eq!(config.negatives_per_label(), 99);
     }
 
     #[test]
@@ -1781,7 +1803,7 @@ mod tests {
         config.max_labels_per_head = Some(3);
         config.min_train_positives = 1;
         config.min_test_positives = 1;
-        config.max_negatives_per_label = 256;
+        config.max_negatives_per_label = Some(256);
         config.population_size = 16;
         config.generation_limit = 6;
         config.stagnation_limit = 3;
@@ -1994,7 +2016,7 @@ mod tests {
         config.max_labels_per_head = Some(3);
         config.min_train_positives = 1;
         config.min_test_positives = 1;
-        config.max_negatives_per_label = 256;
+        config.max_negatives_per_label = Some(256);
         config.population_size = 12;
         config.generation_limit = 2;
         config.stagnation_limit = 2;
