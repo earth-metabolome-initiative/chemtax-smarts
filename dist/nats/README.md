@@ -17,7 +17,7 @@ This is the lighter-weight alternative to `slurm/lrc/` for a handful of machines
 - The binary built with the NATS feature on every machine: `cargo build --release --features nats`.
 - Each machine needs its own local dataset copy and enough RAM to hold the splits (GBs for ClassyFire). The first worker run downloads that machine's copy from Zenodo automatically. NATS only carries label ids, never the data.
 
-Optional environment overrides: `CHEMTAX_REPO_DIR` (default `$HOME/chemtax-smarts`), `CHEMTAX_DATA_DIR`, `CHEMTAX_OUTPUT_DIR`, and the broker's `CHEMTAX_NATS_ADDR` / `CHEMTAX_NATS_PORT` / `CHEMTAX_NATS_STORE`.
+The scripts find the repo from their own location, so you can run them from anywhere. Optional environment overrides: `CHEMTAX_REPO_DIR` (default: the checkout the scripts live in), `CHEMTAX_DATA_DIR` (default `<repo>/data/<dataset>`), `CHEMTAX_OUTPUT_DIR`, and the broker's `CHEMTAX_NATS_ADDR` / `CHEMTAX_NATS_PORT` / `CHEMTAX_NATS_STORE`.
 
 ## Run
 

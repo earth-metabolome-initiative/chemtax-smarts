@@ -11,7 +11,8 @@ DATASET="${1:?Usage: seed.sh <npclassifier|classyfire> <nats-url> [extra args...
 NATS_URL="${2:?Usage: seed.sh <dataset> <nats-url> [extra args...]}"
 shift 2
 
-REPO_DIR="${CHEMTAX_REPO_DIR:-$HOME/chemtax-smarts}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${CHEMTAX_REPO_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 DATA_DIR="${CHEMTAX_DATA_DIR:-$REPO_DIR/data/$DATASET}"
 BINARY="$REPO_DIR/target/release/chemtax-smarts"
 

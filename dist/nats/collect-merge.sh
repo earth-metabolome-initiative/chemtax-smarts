@@ -16,7 +16,8 @@ if [ "$#" -lt 1 ]; then
     exit 1
 fi
 
-REPO_DIR="${CHEMTAX_REPO_DIR:-$HOME/chemtax-smarts}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${CHEMTAX_REPO_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 BINARY="$REPO_DIR/target/release/chemtax-smarts"
 COLLECT_DIR="${CHEMTAX_COLLECT_DIR:-$REPO_DIR/results/$DATASET/collected}"
 REMOTE_OUTPUT="${CHEMTAX_REMOTE_OUTPUT:-chemtax-smarts/results/$DATASET}"
