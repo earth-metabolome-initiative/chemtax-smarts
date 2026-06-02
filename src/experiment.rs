@@ -61,6 +61,10 @@ pub enum ExperimentError {
         /// Underlying error message.
         message: String,
     },
+    /// A `NATS` or `JetStream` operation failed.
+    #[cfg(feature = "nats")]
+    #[error("nats error: {0}")]
+    Nats(String),
     /// A parquet split is missing an expected column.
     #[error("missing parquet column {column} in split {split}")]
     MissingParquetColumn {
@@ -205,6 +209,38 @@ pub struct ExperimentConfig {
     /// Disable slow-evaluation logging entirely.
     #[arg(long)]
     pub disable_slow_evaluation_logging: bool,
+    /// `NATS` server URL. When set, this process runs as a distributed worker
+    /// that pulls labels from the work queue instead of evolving its own shard.
+    #[cfg(feature = "nats")]
+    #[arg(long)]
+    pub nats_url: Option<String>,
+    /// Seed the `NATS` work queue with the remaining labels and exit. Requires
+    /// `--nats-url`. Run this once before starting the workers.
+    #[cfg(feature = "nats")]
+    #[arg(long)]
+    pub seed_queue: bool,
+    /// Name of the `JetStream` work-queue stream. Defaults to `chemtax-<dataset>`.
+    #[cfg(feature = "nats")]
+    #[arg(long)]
+    pub nats_stream: Option<String>,
+    /// Redelivery timeout for an in-flight label, in seconds. A worker sends
+    /// progress pings while evolving, so this is only a backstop for a crash.
+    #[cfg(feature = "nats")]
+    #[arg(long, default_value_t = 1_800)]
+    pub nats_ack_wait_secs: u64,
+    /// A worker exits after this many seconds with an empty queue.
+    #[cfg(feature = "nats")]
+    #[arg(long, default_value_t = 120)]
+    pub nats_idle_exit_secs: u64,
+    /// Merge every `results.jsonl` under this directory into one deduplicated log
+    /// and exit. Use after collecting the per-worker logs onto one host.
+    #[cfg(feature = "nats")]
+    #[arg(long)]
+    pub merge_logs: Option<PathBuf>,
+    /// Output path for `--merge-logs`. Defaults to `<merge-logs>/results.jsonl`.
+    #[cfg(feature = "nats")]
+    #[arg(long)]
+    pub merged_output: Option<PathBuf>,
 }
 
 impl ExperimentConfig {
@@ -1378,6 +1414,312 @@ fn write_json(
     Ok(())
 }
 
+/// `NATS` `JetStream` distribution across workstations. A seeder publishes one
+/// message per remaining label onto a work-queue stream; each worker pulls and
+/// acks one label at a time, evolving it locally and appending to its own
+/// `results.jsonl`. Compiled only with the `nats` feature.
+#[cfg(feature = "nats")]
+pub mod distributed {
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_nats::jetstream::consumer::{AckPolicy, pull};
+    use async_nats::jetstream::stream::{Config as StreamConfig, RetentionPolicy};
+    use async_nats::jetstream::{self, AckKind};
+    use futures::StreamExt;
+    use serde::{Deserialize, Serialize};
+
+    use super::{
+        ExperimentConfig, ExperimentError, ExperimentProgress, LoadedInputs, PlannedLabelTask,
+        TaskOutcome, TaskRunContext, append_task_log_entry, build_seed_corpus, initialize_results,
+        load_inputs, load_recorded_outcomes, load_resume_seed_keys, outcome_key,
+        persist_run_metadata, run_label_task, sorted_task_plan,
+    };
+    use crate::download::DatasetName;
+
+    /// One unit of work on the queue: the label identity a worker should evolve.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TaskId {
+        head: String,
+        label_id: u16,
+    }
+
+    fn nats_error(error: impl std::fmt::Display) -> ExperimentError {
+        ExperimentError::Nats(error.to_string())
+    }
+
+    fn stream_name(config: &ExperimentConfig) -> String {
+        config.nats_stream.clone().unwrap_or_else(|| {
+            let slug = match config.dataset {
+                DatasetName::Npclassifier => "npclassifier",
+                DatasetName::Classyfire => "classyfire",
+            };
+            format!("chemtax-{slug}")
+        })
+    }
+
+    async fn connect(config: &ExperimentConfig) -> Result<jetstream::Context, ExperimentError> {
+        let url = config
+            .nats_url
+            .as_deref()
+            .ok_or_else(|| ExperimentError::Nats("--nats-url is required".to_owned()))?;
+        let client = async_nats::connect(url).await.map_err(nats_error)?;
+        Ok(jetstream::new(client))
+    }
+
+    /// Publish the remaining labels onto the work queue, then exit. Run once
+    /// before starting the workers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dataset cannot be loaded, the stream cannot be
+    /// created or purged, or a message cannot be published.
+    pub async fn seed_queue(config: &ExperimentConfig) -> Result<(), ExperimentError> {
+        let inputs = load_inputs(config).await?;
+        let plan = sorted_task_plan(config, &inputs)?;
+        let done = load_resume_seed_keys(&config.resume_from)?;
+
+        let name = stream_name(config);
+        let subject = format!("{name}.tasks");
+        let context = connect(config).await?;
+        context
+            .create_stream(StreamConfig {
+                name: name.clone(),
+                subjects: vec![subject.clone()],
+                retention: RetentionPolicy::WorkQueue,
+                ..Default::default()
+            })
+            .await
+            .map_err(nats_error)?;
+        let stream = context.get_stream(&name).await.map_err(nats_error)?;
+        // One-time seed: drop anything left from a previous round.
+        stream.purge().await.map_err(nats_error)?;
+
+        let mut enqueued = 0usize;
+        for task in &plan {
+            if done.contains(&(task.head_name.clone(), task.label_id)) {
+                continue;
+            }
+            let payload = serde_json::to_vec(&TaskId {
+                head: task.head_name.clone(),
+                label_id: task.label_id,
+            })?;
+            context
+                .publish(subject.clone(), payload.into())
+                .await
+                .map_err(nats_error)?
+                .await
+                .map_err(nats_error)?;
+            enqueued += 1;
+        }
+
+        eprintln!("seeded {enqueued} labels onto stream {name}");
+        Ok(())
+    }
+
+    /// Run as a worker: pull labels from the queue, evolve each, append to the
+    /// local `results.jsonl`, and ack. Exits when the queue stays empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the dataset cannot be loaded, the consumer cannot be
+    /// created, or a label task fails to evolve.
+    pub async fn run_worker(config: &ExperimentConfig) -> Result<(), ExperimentError> {
+        let inputs = Arc::new(load_inputs(config).await?);
+        persist_run_metadata(config, &inputs.downloaded_files)?;
+        // Fail fast on an inconsistent GA config before connecting.
+        let _ = config.evolution_config()?;
+
+        let plan = sorted_task_plan(config, &inputs)?;
+        let lookup: HashMap<(String, u16), PlannedLabelTask> = plan
+            .into_iter()
+            .map(|task| ((task.head_name.clone(), task.label_id), task))
+            .collect();
+
+        let results_path = config.output_dir.join("results.jsonl");
+        let mut done: HashSet<(String, u16)> = initialize_results(&results_path, config.fresh)?
+            .iter()
+            .map(outcome_key)
+            .collect();
+
+        let name = stream_name(config);
+        let context = connect(config).await?;
+        let stream = context.get_stream(&name).await.map_err(nats_error)?;
+        let consumer = stream
+            .create_consumer(pull::Config {
+                durable_name: Some(format!("{name}-workers")),
+                ack_policy: AckPolicy::Explicit,
+                ack_wait: Duration::from_secs(config.nats_ack_wait_secs),
+                ..Default::default()
+            })
+            .await
+            .map_err(nats_error)?;
+
+        let idle = Duration::from_secs(config.nats_idle_exit_secs);
+        let mut completed = 0usize;
+        eprintln!("worker connected to {name}; waiting for labels");
+
+        loop {
+            let mut batch = consumer
+                .fetch()
+                .max_messages(1)
+                .expires(idle)
+                .messages()
+                .await
+                .map_err(nats_error)?;
+
+            let mut received = false;
+            while let Some(message) = batch.next().await {
+                received = true;
+                let message = message.map_err(nats_error)?;
+                let Ok(task_id) = serde_json::from_slice::<TaskId>(&message.payload) else {
+                    eprintln!("skipping malformed task message");
+                    message.ack().await.map_err(nats_error)?;
+                    continue;
+                };
+                let key = (task_id.head.clone(), task_id.label_id);
+                if done.contains(&key) {
+                    message.ack().await.map_err(nats_error)?;
+                    continue;
+                }
+                let Some(task) = lookup.get(&key).cloned() else {
+                    eprintln!(
+                        "no planned task for {}:{} (different dataset or cutoff?); acking",
+                        task_id.head, task_id.label_id
+                    );
+                    message.ack().await.map_err(nats_error)?;
+                    continue;
+                };
+
+                let outcome =
+                    evolve_with_heartbeat(&message, Arc::clone(&inputs), config.clone(), task)
+                        .await?;
+                append_task_log_entry(&results_path, &outcome)?;
+                done.insert(key);
+                message.ack().await.map_err(nats_error)?;
+                completed += 1;
+            }
+
+            if !received {
+                break;
+            }
+        }
+
+        eprintln!("worker drained queue; completed {completed} labels this run");
+        Ok(())
+    }
+
+    /// Evolve one label on a blocking thread while pinging the broker so a label
+    /// that runs longer than `ack_wait` is not redelivered mid-flight.
+    async fn evolve_with_heartbeat(
+        message: &jetstream::Message,
+        inputs: Arc<LoadedInputs>,
+        config: ExperimentConfig,
+        task: PlannedLabelTask,
+    ) -> Result<TaskOutcome, ExperimentError> {
+        let mut handle = tokio::task::spawn_blocking(move || {
+            let evolution_config = config.evolution_config()?;
+            let seed_corpus = build_seed_corpus()?;
+            let progress = ExperimentProgress::new(1, false);
+            let context = TaskRunContext {
+                config: &config,
+                evolution_config: &evolution_config,
+                seed_corpus,
+                progress: &progress,
+                inputs: &inputs,
+            };
+            run_label_task(&context, &task)
+        });
+
+        let mut ticker = tokio::time::interval(Duration::from_secs(30));
+        ticker.tick().await;
+        let joined = loop {
+            tokio::select! {
+                result = &mut handle => break result,
+                _ = ticker.tick() => {
+                    let _ = message.ack_with(AckKind::Progress).await;
+                }
+            }
+        };
+        joined.map_err(|error| ExperimentError::Nats(format!("worker task panicked: {error}")))?
+    }
+
+    /// Merge every `results.jsonl` under `--merge-logs` into one deduplicated log,
+    /// keyed by `(head, label_id)`. Use after collecting the per-worker logs onto
+    /// one host.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be walked or a log cannot be read
+    /// or written.
+    pub fn merge_logs(config: &ExperimentConfig) -> Result<(), ExperimentError> {
+        let Some(dir) = config.merge_logs.as_deref() else {
+            return Err(ExperimentError::Nats("--merge-logs is required".to_owned()));
+        };
+        let mut logs = Vec::new();
+        collect_jsonl(dir, &mut logs)?;
+        logs.sort();
+
+        let mut merged: HashMap<(String, u16), TaskOutcome> = HashMap::new();
+        for path in &logs {
+            for outcome in load_recorded_outcomes(path)? {
+                merged.insert(outcome_key(&outcome), outcome);
+            }
+        }
+        let mut entries: Vec<((String, u16), TaskOutcome)> = merged.into_iter().collect();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let output = config
+            .merged_output
+            .clone()
+            .unwrap_or_else(|| dir.join("results.jsonl"));
+        std::fs::File::create(&output)?;
+        for (_, outcome) in &entries {
+            append_task_log_entry(&output, outcome)?;
+        }
+
+        eprintln!(
+            "merged {} log file(s) into {} ({} labels)",
+            logs.len(),
+            output.display(),
+            entries.len()
+        );
+        Ok(())
+    }
+
+    fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), ExperimentError> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                collect_jsonl(&path, out)?;
+            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::TaskId;
+        use crate::test_support::ok;
+
+        #[test]
+        fn task_id_round_trips_through_json() {
+            let task_id = TaskId {
+                head: "class".to_owned(),
+                label_id: 42,
+            };
+            let bytes = ok(serde_json::to_vec(&task_id));
+            let decoded: TaskId = ok(serde_json::from_slice(&bytes));
+            assert_eq!(decoded.head, "class");
+            assert_eq!(decoded.label_id, 42);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1424,6 +1766,20 @@ mod tests {
             disable_match_time_limit: false,
             slow_evaluation_log_threshold_millis: 30_000,
             disable_slow_evaluation_logging: false,
+            #[cfg(feature = "nats")]
+            nats_url: None,
+            #[cfg(feature = "nats")]
+            seed_queue: false,
+            #[cfg(feature = "nats")]
+            nats_stream: None,
+            #[cfg(feature = "nats")]
+            nats_ack_wait_secs: 1_800,
+            #[cfg(feature = "nats")]
+            nats_idle_exit_secs: 120,
+            #[cfg(feature = "nats")]
+            merge_logs: None,
+            #[cfg(feature = "nats")]
+            merged_output: None,
         }
     }
 
@@ -2480,6 +2836,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&local_out);
         let _ = std::fs::remove_dir_all(&seeded_out);
+    }
+
+    #[cfg(feature = "nats")]
+    #[test]
+    fn merge_logs_dedups_across_worker_logs_by_label() {
+        fn skipped(head: &str, label_id: u16) -> TaskOutcome {
+            TaskOutcome::Skipped(SkippedTaskReport {
+                head: head.to_owned(),
+                label_id,
+                label_name: format!("l{label_id}"),
+                reason: "test".to_owned(),
+                training_counts: SplitCounts {
+                    rows: 0,
+                    positives: 0,
+                    negatives: 0,
+                },
+                test_counts: SplitCounts {
+                    rows: 0,
+                    positives: 0,
+                    negatives: 0,
+                },
+            })
+        }
+
+        let root = temp_dir("merge-logs");
+        let worker_a = root.join("worker-a");
+        let worker_b = root.join("worker-b");
+        ok(std::fs::create_dir_all(&worker_a));
+        ok(std::fs::create_dir_all(&worker_b));
+        ok(std::fs::File::create(worker_a.join("results.jsonl")));
+        ok(std::fs::File::create(worker_b.join("results.jsonl")));
+
+        // (class,1) appears in both logs (a crash-before-ack duplicate).
+        for outcome in [skipped("class", 0), skipped("class", 1)] {
+            ok(append_task_log_entry(
+                &worker_a.join("results.jsonl"),
+                &outcome,
+            ));
+        }
+        for outcome in [skipped("class", 1), skipped("class", 2)] {
+            ok(append_task_log_entry(
+                &worker_b.join("results.jsonl"),
+                &outcome,
+            ));
+        }
+
+        let mut config = baseline_config();
+        let merged_path = root.join("merged.jsonl");
+        config.merge_logs = Some(root.clone());
+        config.merged_output = Some(merged_path.clone());
+        ok(super::distributed::merge_logs(&config));
+
+        let merged = ok(std::fs::read_to_string(&merged_path));
+        let keys: Vec<(String, u16)> = merged
+            .lines()
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_str::<TaskOutcome>(line).ok())
+            .map(|outcome| outcome_key(&outcome))
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("class".to_owned(), 0),
+                ("class".to_owned(), 1),
+                ("class".to_owned(), 2),
+            ],
+            "the duplicate label collapses and output is sorted by key"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
