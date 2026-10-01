@@ -10,7 +10,7 @@
 
 ## Run
 
-`--dataset` is required and selects one taxonomy per run.
+Requires Rust `1.92` or newer. `--dataset` is required and selects one taxonomy per run.
 
 ```bash
 # NPClassifier (Zenodo 19701295)

@@ -14,7 +14,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use smarts_evolution::{FoldData, FoldSample};
 use smarts_rs::PreparedTarget;
-use smiles_parser::Smiles;
+use smiles_rs::Smiles;
 
 use crate::experiment::ExperimentError;
 use crate::util::usize_to_u64;
