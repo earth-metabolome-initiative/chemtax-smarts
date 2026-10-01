@@ -2,7 +2,7 @@
 name = "chemtax-smarts"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.92"
 license = "MIT"
 description = "Experiment that evolves SMARTS classifiers for chemical-taxonomy label datasets (NPClassifier, ClassyFire) published on Zenodo."
 repository = "https://github.com/earth-metabolome-initiative/chemtax-smarts"
@@ -29,7 +29,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 smarts-evolution = { git = "https://github.com/earth-metabolome-initiative/smarts-evolution", branch = "main", features = ["indicatif", "tui"] }
 smarts-rs = { git = "https://github.com/earth-metabolome-initiative/smarts-rs", branch = "main" }
-smiles-parser = { git = "https://github.com/earth-metabolome-initiative/smiles-parser", branch = "main", default-features = false }
+smiles-rs = { version = "0.1.5", default-features = false }
 thiserror = "2.0.18"
 tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "time"] }
 zenodo-rs = { version = "0.1.6", features = ["checksums"] }
